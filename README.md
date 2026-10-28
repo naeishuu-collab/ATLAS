@@ -2,6 +2,8 @@
 
 **Autonomous Task, Learning & Assistance System**
 
+![ATLAS workspace](assets/atlas-hero.png)
+
 ATLAS is a Windows-first autonomous AI agent designed to plan, execute, observe,
 verify, recover, and re-plan tasks while keeping final authorization inside
 ATLAS.
