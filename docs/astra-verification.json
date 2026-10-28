@@ -1,0 +1,494 @@
+{
+  "date": "2026-10-04",
+  "timezone": "Asia/Tokyo",
+  "status": "VERIFIED_LIMITED_COOPERATIVE_SAFE_REPLAN_NOT_PRODUCTION_READY",
+  "production_ready": false,
+  "branch": "codex/astra-reliability",
+  "baseline_commit": "1a9c8cf70fbc24872ba2327115040d4c7a99a11a",
+  "implementation_head": "7eb95fea",
+  "recovery_tag": "astra-run-baseline-20261003",
+  "test_counts_overlap": true,
+  "baseline_focused": {
+    "passed": 111,
+    "failed": 1,
+    "skipped": 8,
+    "seconds": 7.1
+  },
+  "last_broad_regression": {
+    "scope": [
+      "agents",
+      "tools",
+      "server",
+      "security",
+      "core/test_utils.py",
+      "core/test_credentials.py",
+      "traces"
+    ],
+    "excluded_markers": [
+      "live",
+      "cloud",
+      "hub",
+      "modal",
+      "live_external",
+      "live_channel"
+    ],
+    "implementation_phase": 15,
+    "passed": 2823,
+    "failed": 0,
+    "skipped": 68,
+    "errors": 0,
+    "warnings": 271,
+    "seconds": 262.33,
+    "native_mutation_file_excluded": true
+  },
+  "subsequent_browser_agent_stream_regression": {
+    "implementation_phase": 11,
+    "passed": 147,
+    "failed": 0,
+    "seconds": 7.04,
+    "real_chromium_tests_included": 13,
+    "model": "SCRIPTED_ENGINE_NO_REAL_LLM_INFERENCE"
+  },
+  "trace_dispatch_regression": {
+    "passed": 209,
+    "failed": 0,
+    "seconds": 4.21
+  },
+  "loop_dispatch_regression": {
+    "passed": 165,
+    "failed": 0,
+    "seconds": 2.88
+  },
+  "safety_regression_before_browser_message_repair": {
+    "passed": 148,
+    "failed": 0,
+    "skipped": 8,
+    "seconds": 42.83
+  },
+  "full_suite": {
+    "execution": "NOT_EXECUTED",
+    "phase": "phase15_quarantine_trace",
+    "reason": "Focused/broad event-boundary regressions executed; unrestricted cec283d8 run remains separate."
+  },
+  "lint": {
+    "ruff_check": "PASSED",
+    "ruff_format_check": "PASSED",
+    "last_checked_python_files": 24
+  },
+  "native_extension": {
+    "build": "SUCCEEDED",
+    "artifact": "CPython 3.11 Windows AMD64 from this source",
+    "source_checkpoint": "39e2407d",
+    "loaded_sha256": "8fb8e5421e8a33a282ae14550fb48b520aa75840bbe4c0d20df8bb6b46abb824",
+    "matches_build_dll": true,
+    "native_bridge_bm25": {
+      "passed": 35,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0
+    },
+    "native_agents": {
+      "passed": 112,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0
+    },
+    "rust_workspace": {
+      "passed": 421,
+      "failed": 5,
+      "skipped": 0,
+      "warnings": 1,
+      "failures": "pre-existing symlink fixture Windows 1314 before policy assertions"
+    },
+    "original_blocker": "Smart App Control / Code Integrity VerifiedAndReputableDesktop rejected unsigned libsqlite3-sys build-script executable",
+    "original_os_error": 4551,
+    "current_minimal_reproduction": "original executable admitted without modification, then intentional OUT_DIR panic before SQLite build",
+    "later_admission_reason": "NOT_ESTABLISHED_BY_AVAILABLE_LOGS",
+    "os_security_policy_changed": false,
+    "policy_still_enforced": true
+  },
+  "live_model_inference": "NOT_EXECUTED",
+  "windows_uia": {
+    "status": "COOPERATIVE_FIXTURE_MUTATION_VERIFIED",
+    "physical_mutation_allowed": false,
+    "registered_physical_tools": true,
+    "tests": {
+      "passed": 50,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 37.58,
+      "policy_cases": 32,
+      "windows_cases": 18
+    },
+    "live_same_numeric_pid_hwnd_reuse": "NOT_FORCED; deterministic policy fixtures cover reuse",
+    "limitations": [
+      "asynchronous events are not atomic action lifetime guarantees",
+      "no application-specific post-mutation verifier or mutation transport",
+      "provider visibility requires additional native checks; complete occlusion/hit-testing not proven",
+      "not arbitrary elevated/custom/malicious provider coverage"
+    ],
+    "historical_observation_status": "OBSERVATION_ONLY",
+    "binding_gate": "Explicit trusted cooperative receiver and confirmation required; default unbound"
+  },
+  "external_account_mutation": "NOT_EXECUTED",
+  "voice_e2e": "NOT_EXECUTED",
+  "desktop_ui_live_validation": "REAL_WIN32_UIA_SYNTHETIC_FIXTURES; NO_USER_APP_MUTATION",
+  "production_deployment": "NOT_EXECUTED",
+  "historical_checkpoint_11": {
+    "date": "2026-10-03",
+    "timezone": "Asia/Tokyo",
+    "status": "PARTIAL_BLOCKED_NATIVE_INTEGRATION",
+    "production_ready": false,
+    "branch": "codex/astra-reliability",
+    "baseline_commit": "1a9c8cf70fbc24872ba2327115040d4c7a99a11a",
+    "implementation_head": "f0af3e99",
+    "recovery_tag": "astra-run-baseline-20261003",
+    "test_counts_overlap": true,
+    "baseline_focused": {
+      "passed": 111,
+      "failed": 1,
+      "skipped": 8,
+      "seconds": 7.1
+    },
+    "last_broad_regression": {
+      "scope": [
+        "agents",
+        "tools",
+        "server",
+        "security",
+        "core/test_utils.py",
+        "traces"
+      ],
+      "excluded_markers": [
+        "live",
+        "cloud",
+        "hub",
+        "modal",
+        "live_external",
+        "live_channel"
+      ],
+      "implementation_phase": 10,
+      "passed": 2540,
+      "failed": 168,
+      "skipped": 69,
+      "errors": 0,
+      "warnings": 265,
+      "selected": 2777,
+      "seconds": 189.81,
+      "failure_classification": {
+        "missing_rust": 163,
+        "posix_permission_assertions_on_windows": 5
+      }
+    },
+    "subsequent_browser_agent_stream_regression": {
+      "implementation_phase": 11,
+      "passed": 147,
+      "failed": 0,
+      "seconds": 7.04,
+      "real_chromium_tests_included": 13,
+      "model": "SCRIPTED_ENGINE_NO_REAL_LLM_INFERENCE"
+    },
+    "trace_dispatch_regression": {
+      "passed": 209,
+      "failed": 0,
+      "seconds": 4.21
+    },
+    "loop_dispatch_regression": {
+      "passed": 165,
+      "failed": 0,
+      "seconds": 2.88
+    },
+    "safety_regression_before_browser_message_repair": {
+      "passed": 148,
+      "failed": 0,
+      "skipped": 8,
+      "seconds": 42.83
+    },
+    "full_suite": {
+      "execution": "NOT_EXECUTED",
+      "collection": {
+        "selected": 9036,
+        "total": 9073,
+        "deselected": 37,
+        "errors": 1,
+        "seconds": 13.49
+      },
+      "collection_error": "tests/memory/test_bm25.py requires openjarvis_rust"
+    },
+    "lint": {
+      "ruff_check": "PASSED",
+      "ruff_format_check": "PASSED",
+      "changed_python_files": 40
+    },
+    "native_extension": {
+      "build": "FAILED",
+      "tests": "NOT_EXECUTED",
+      "blocker": "Windows application control refused generated libsqlite3-sys build script",
+      "os_error": 4551,
+      "os_security_policy_changed": false
+    },
+    "live_model_inference": "NOT_EXECUTED",
+    "windows_uia": "NOT_IMPLEMENTED",
+    "external_account_mutation": "NOT_EXECUTED",
+    "voice_e2e": "NOT_EXECUTED",
+    "desktop_ui_live_validation": "NOT_EXECUTED",
+    "production_deployment": "NOT_EXECUTED"
+  },
+  "phase12_starting_checkpoint": "d63643ce",
+  "windows_private_permissions": {
+    "implementation": "protected owner-only DACL created before data writes and verified on pinned handle",
+    "combined_tests": {
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0
+    },
+    "additional_credential_assertion": "native DACL semantics on Windows; exact mode on Unix"
+  },
+  "timing_credentials_regression": {
+    "passed": 134,
+    "failed": 0,
+    "skipped": 0,
+    "warnings": 0,
+    "seconds": 4.26
+  },
+  "rss_post_full_regression": {
+    "passed": 79,
+    "failed": 0,
+    "skipped": 0,
+    "warnings": 1,
+    "seconds": 4.29,
+    "scope": [
+      "tests/server/test_connectors_router.py",
+      "tests/connectors/test_news_rss.py",
+      "tests/security/test_ssrf.py"
+    ]
+  },
+  "rss_baseline_dns_outage_reproduction": {
+    "passed": 0,
+    "failed": 1,
+    "skipped": 0,
+    "warnings": 1,
+    "seconds": 2.79,
+    "production_ssrf_validation_weakened": false
+  },
+  "historical_full_suite": {
+    "execution": "EXECUTED",
+    "previous_phase12_completed": {
+      "passed": 8875,
+      "failed": 87,
+      "skipped": 139,
+      "errors": 0,
+      "warnings": 297,
+      "seconds": 4877.67
+    },
+    "failure_audit": "docs/astra-phase13-full-audit.json",
+    "baseline_selected_failure_reproduction": {
+      "passed": 2,
+      "failed": 85,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 24.18
+    },
+    "implementation_head": "25d4a906",
+    "command": "python -m pytest -q --junitxml=.astra-tools/phase13-full.xml",
+    "pythonpath": "src;.venv/Lib/site-packages",
+    "passed": 8937,
+    "failed": 80,
+    "skipped": 139,
+    "warnings": 291,
+    "errors": 0,
+    "selected": 9156,
+    "seconds": 825.56,
+    "post_full_test_only_repair": "3eb4ad9f controls RSS fixture DNS and adds outage refusal; no production change after full run; full counts not adjusted; no third full run"
+  },
+  "phase13_mutation": {
+    "starting_checkpoint": "f887719e",
+    "checkpoint": "cec283d884128bf703e37fe5f7b714f26dd528ec",
+    "status": "VERIFIED_NARROW_COOPERATIVE_WIN32_FIXTURE",
+    "default_binding": "UNBOUND_FAIL_CLOSED",
+    "os_security_policy_changed": false,
+    "gate": {
+      "passed": 17,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 20.94,
+      "command": "python -m scripts.astra_windows_mutation_e2e --activation-timeout 300 tests/security/test_windows_mutation.py -q --junitxml=.astra-tools/mutation-gate-final.xml"
+    },
+    "controller_boundary": {
+      "passed": 23,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 2.08
+    },
+    "broad_before_final_metadata_additions": {
+      "passed": 2817,
+      "failed": 0,
+      "skipped": 68,
+      "warnings": 271,
+      "seconds": 269.68,
+      "native_mutation_file": "EXCLUDED_AND_EXECUTED_SEPARATELY"
+    },
+    "hwnd_reuse": "NOT_REPRODUCED_64_REPLACEMENTS",
+    "real_app_e2e": "NOT_EXECUTED",
+    "live_llm_inference": "NOT_EXECUTED",
+    "report": "docs/astra-phase13-mutation-report.md",
+    "counts_overlap": true
+  },
+  "phase13_full_suite": {
+    "execution": "EXECUTED",
+    "implementation_head": "cec283d884128bf703e37fe5f7b714f26dd528ec",
+    "phase": "phase13_safe_mutation",
+    "passed": 8970,
+    "failed": 90,
+    "skipped": 139,
+    "warnings": 291,
+    "errors": 0,
+    "seconds": 924.0,
+    "audit": "docs/astra-phase13-mutation-full-audit.json",
+    "classification_counts": {
+      "TEST_FIXTURE_FOREGROUND_SETUP_AFTER_FULL_COLLECTION": 11,
+      "PRODUCTION_WINDOWS_NPM_LAUNCH_FAILURE": 1,
+      "TEST_RICH_OUTPUT_WRAPPING": 2,
+      "ENVIRONMENT_SYMLINK_PRIVILEGE": 2,
+      "TEST_MOCKED_PLATFORM_MISMATCH": 1,
+      "TEST_SUBPROCESS_DEPENDENCY_PATH": 1,
+      "PRODUCTION_POSIX_STRFTIME_FORMAT": 4,
+      "LIVE_FIXTURE_OPEN_SQLITE_CLEANUP": 1,
+      "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG": 12,
+      "TEST_DEFAULT_ENCODING_CP932": 38,
+      "TEST_DIRECT_POSIX_SCRIPT_EXECUTION": 2,
+      "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS": 7,
+      "WINDOWS_INSTALLER_FILE_URL_FAILURE": 1,
+      "TEST_PATH_SEPARATOR_SYNTAX": 1,
+      "TEST_TOML_WINDOWS_BACKSLASH_ESCAPE": 1,
+      "TEST_LINUX_SYSFS_COLON_NAMES": 5
+    },
+    "native_mutation_group": {
+      "passed": 6,
+      "failed": 11,
+      "skipped": 0,
+      "failure_stage": "foreground setup; no action dispatch"
+    }
+  },
+  "phase14_safe_replan": {
+    "starting_checkpoint": "4da954d5",
+    "checkpoint": "7eb95fea",
+    "production_mutation_and_journal_unchanged": true,
+    "native_agent_recovery": {
+      "passed": 5,
+      "failed": 0,
+      "skipped": 0,
+      "deselected": 15,
+      "warnings": 1,
+      "seconds": 119.6,
+      "model": "SCRIPTED_ENGINE_NO_LIVE_LLM",
+      "before_optional_spec_lookup_repair_and_preload_relocation": true
+    },
+    "trace_privacy": {
+      "passed": 25,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 3.08,
+      "raw_inference_events_and_live_messages_redacted": false,
+      "trace_store_and_trace_complete_raw_prose_omitted_for_sensitive_tools": true
+    },
+    "focused_regression": {
+      "passed": 1844,
+      "failed": 0,
+      "skipped": 23,
+      "warnings": 0,
+      "seconds": 146.67
+    },
+    "optional_spec_lookup_repair": {
+      "passed": 26,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 3,
+      "seconds": 4.25
+    },
+    "broad_regression": {
+      "passed": 2820,
+      "failed": 0,
+      "skipped": 68,
+      "warnings": 271,
+      "seconds": 244.62,
+      "native_mutation_file_excluded": true
+    },
+    "unsuccessful_native_batches": [
+      {
+        "passed": 11,
+        "failed": 9,
+        "skipped": 0,
+        "warnings": 0,
+        "seconds": 186.46
+      },
+      {
+        "passed": 8,
+        "failed": 12,
+        "skipped": 0,
+        "warnings": 0,
+        "seconds": 19.92
+      },
+      {
+        "passed": 14,
+        "failed": 6,
+        "skipped": 0,
+        "warnings": 0,
+        "seconds": 145.04
+      }
+    ],
+    "combined_native_20_after_final_setup_repairs": "NOT_EXECUTED",
+    "full_suite": "NOT_EXECUTED",
+    "real_application_e2e": "NOT_EXECUTED",
+    "report": "docs/astra-phase14-safe-replan.md",
+    "known_limits": [
+      "Foreground transitions not fully explained; no focus bypass",
+      "Cooperative receivers only",
+      "Scripted agent decisions only",
+      "Raw inference EventBus and arbitrary metadata privacy unverified",
+      "HWND reuse NOT REPRODUCED"
+    ]
+  },
+  "phase15_quarantine_trace": {
+    "starting_checkpoint": "7eb95fea",
+    "checkpoint": "Recorded in following metadata checkpoint",
+    "before_repair": {
+      "passed": 0,
+      "failed": 3,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 4.22
+    },
+    "focused": {
+      "passed": 95,
+      "failed": 0,
+      "skipped": 0,
+      "warnings": 0,
+      "seconds": 4.69
+    },
+    "broad": {
+      "passed": 2823,
+      "failed": 0,
+      "skipped": 68,
+      "warnings": 271,
+      "seconds": 262.33,
+      "native_mutation_file_excluded": true
+    },
+    "full_suite": "NOT_EXECUTED",
+    "new_physical_windows_e2e": "NOT_EXECUTED",
+    "guards": [
+      "in-memory quarantine",
+      "reopened durable quarantine",
+      "journal unavailable"
+    ],
+    "request_dispatch": "NOT_DISPATCHED",
+    "original_unresolved_outcomes_preserved": true,
+    "end_publication_outside_mutation_lock": true,
+    "report": "docs/astra-phase15-quarantine-trace.md"
+  }
+}

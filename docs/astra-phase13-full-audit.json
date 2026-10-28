@@ -1,0 +1,513 @@
+{
+  "implementation_head": "25d4a906",
+  "command": "python -m pytest -q --junitxml=.astra-tools/phase13-full.xml",
+  "passed": 8937,
+  "failed": 80,
+  "skipped": 139,
+  "warnings": 291,
+  "errors": 0,
+  "seconds": 825.56,
+  "test_counts_overlap": true,
+  "classification_counts": {
+    "ENVIRONMENT_SYMLINK_PRIVILEGE": 2,
+    "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG": 12,
+    "LIVE_FIXTURE_OPEN_SQLITE_CLEANUP": 1,
+    "PRODUCTION_POSIX_STRFTIME_FORMAT": 4,
+    "PRODUCTION_WINDOWS_NPM_LAUNCH_FAILURE": 1,
+    "TEST_DEFAULT_ENCODING_CP932": 38,
+    "TEST_DIRECT_POSIX_SCRIPT_EXECUTION": 2,
+    "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS": 7,
+    "TEST_LINUX_SYSFS_COLON_NAMES": 5,
+    "TEST_LIVE_DNS_IN_MOCKED_CONFIGURATION_CONTRACT": 1,
+    "TEST_MOCKED_PLATFORM_MISMATCH": 1,
+    "TEST_PATH_SEPARATOR_SYNTAX": 1,
+    "TEST_RICH_OUTPUT_WRAPPING": 2,
+    "TEST_SUBPROCESS_DEPENDENCY_PATH": 1,
+    "TEST_TOML_WINDOWS_BACKSLASH_ESCAPE": 1,
+    "WINDOWS_INSTALLER_FILE_URL_FAILURE": 1
+  },
+  "failures": [
+    {
+      "class": "tests.channels.test_channel_contract",
+      "test": "test_connect_no_credentials_no_crash[whatsapp_baileys]",
+      "classification": "PRODUCTION_WINDOWS_NPM_LAUNCH_FAILURE",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.cli.test_model_convert.TestModelConvert",
+      "test": "test_convert_gguf_shells_and_quantizes",
+      "classification": "TEST_RICH_OUTPUT_WRAPPING",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.cli.test_model_convert.TestModelConvert",
+      "test": "test_force_replaces_symlink_without_touching_target",
+      "classification": "ENVIRONMENT_SYMLINK_PRIVILEGE",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.cli.test_model_convert.TestModelConvert",
+      "test": "test_convert_refuses_empty_directory_symlink_without_force",
+      "classification": "ENVIRONMENT_SYMLINK_PRIVILEGE",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.cli.test_scan.TestRunQuick",
+      "test": "test_run_quick_returns_subset",
+      "classification": "TEST_MOCKED_PLATFORM_MISMATCH",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.cli.test_scan_data_boundaries",
+      "test": "test_data_boundary_cli_reports_real_root_error_without_import_crash",
+      "classification": "TEST_SUBPROCESS_DEPENDENCY_PATH",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_apple_calendar",
+      "test": "test_timezone_is_converted_before_display",
+      "classification": "PRODUCTION_POSIX_STRFTIME_FORMAT",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_apple_calendar",
+      "test": "test_recurring_master_outside_window_yields_distinct_occurrences",
+      "classification": "PRODUCTION_POSIX_STRFTIME_FORMAT",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_apple_calendar",
+      "test": "test_recurring_master_is_not_duplicated_by_same_start_occurrence",
+      "classification": "PRODUCTION_POSIX_STRFTIME_FORMAT",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_apple_calendar",
+      "test": "test_calendar_tools_are_registered_and_executable",
+      "classification": "PRODUCTION_POSIX_STRFTIME_FORMAT",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_live_smoke",
+      "test": "test_live_obsidian_full_pipeline",
+      "classification": "LIVE_FIXTURE_OPEN_SQLITE_CLEANUP",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_new_connectors_live.TestOuraLive",
+      "test": "test_sync_returns_documents",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_new_connectors_live.TestStravaLive",
+      "test": "test_sync_returns_documents",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_new_connectors_live.TestSpotifyLive",
+      "test": "test_sync_returns_documents",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.connectors.test_new_connectors_live.TestGoogleTasksLive",
+      "test": "test_sync_returns_documents",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deploy.test_deploy_auth",
+      "test": "test_docker_compose_requires_api_key",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deploy.test_deploy_auth",
+      "test": "test_docker_env_example_present",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deploy.test_deploy_auth",
+      "test": "test_systemd_unit_binds_public_and_requires_env_file",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deploy.test_render_blueprint",
+      "test": "test_render_selects_cloud_engine_through_the_serve_cli",
+      "classification": "TEST_DIRECT_POSIX_SCRIPT_EXECUTION",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deploy.test_render_blueprint",
+      "test": "test_docker_and_compose_command_overrides_remain_jarvis_subcommands",
+      "classification": "TEST_DIRECT_POSIX_SCRIPT_EXECUTION",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestDockerFiles",
+      "test": "test_dockerfile_has_entrypoint",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestDockerFiles",
+      "test": "test_dockerfile_copies_forced_package_includes",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestDockerFiles",
+      "test": "test_docker_compose_valid_yaml",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestDockerFiles",
+      "test": "test_docker_compose_has_services",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestDockerFiles",
+      "test": "test_dockerfiles_build_native_rust_extension",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestImagePinning",
+      "test": "test_no_floating_latest_tag_in_image_directives",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestImagePinning",
+      "test": "test_every_from_pins_a_digest",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestImagePinning",
+      "test": "test_ollama_image_pinned_with_version_and_digest",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestNonRootUser",
+      "test": "test_creates_and_switches_to_non_root_user",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestNonRootUser",
+      "test": "test_user_directive_is_last_stage",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestFrozenInstall",
+      "test": "test_copies_lockfile",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestFrozenInstall",
+      "test": "test_uses_frozen_export",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestFrozenInstall",
+      "test": "test_no_unpinned_pyproject_resolution",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestSystemdHardening",
+      "test": "test_environment_file_for_secrets",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestSystemdHardening",
+      "test": "test_core_hardening_directives_present",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docker.TestSystemdHardening",
+      "test": "test_writable_state_path_declared",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docs_leaderboard",
+      "test": "test_config_js_declares_anon_key_global",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_docs_leaderboard",
+      "test": "test_leaderboard_reads_the_anon_key_global",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_openjarvis_rust_not_in_published_desktop_extra",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_python310_speech_extras_use_installable_onnxruntime",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_openjarvis_rust_lives_in_uv_dependency_group",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_openjarvis_rust_has_local_uv_path_source",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_desktop_app_syncs_the_native_group",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_quickstart_installs_web_search_dependencies",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_claude_runner_wheel_maps_only_runtime_files",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_packaging",
+      "test": "test_sdist_omits_desktop_binaries_and_rebuilds_runtime_wheel",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_reports_both_artifacts_without_checkout_helpers",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_rejects_oversized_wheel_or_sdist[0]",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_rejects_oversized_wheel_or_sdist[1]",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_exact_budget_is_allowed",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_missing_distribution_is_an_error[wheel]",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_missing_distribution_is_an_error[sdist]",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_missing_distribution_is_an_error[both]",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.deployment.test_release_artifact_validation",
+      "test": "test_metadata_and_size_validation_precede_both_upload_paths",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.engine.test_gemma_cpp.TestGemmaCppLive",
+      "test": "test_real_inference_produces_output",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.engine.test_gemma_cpp.TestGemmaCppLive",
+      "test": "test_prepare_and_close_lifecycle",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.engine.test_gemma_cpp.TestGemmaCppLive",
+      "test": "test_stream_yields_content",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.engine.test_gemma_cpp.TestGemmaCppLive",
+      "test": "test_token_counts_are_positive",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.evals.test_display.TestPrintCompletion",
+      "test": "test_shows_paths",
+      "classification": "TEST_RICH_OUTPUT_WRAPPING",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.evals.test_skill_benchmark.TestWriteReport",
+      "test": "test_write_report_creates_dated_markdown",
+      "classification": "TEST_DEFAULT_ENCODING_CP932",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_bg_state",
+      "test": "test_get_status_model_downloading",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_bg_state",
+      "test": "test_get_status_model_ready",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_bg_state",
+      "test": "test_get_status_model_failed",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_bg_state",
+      "test": "test_get_status_ready_supersedes_downloading",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_bg_state",
+      "test": "test_all_ready_false_when_anything_pending",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_chat_banner",
+      "test": "test_banner_shows_model_downloading",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_doctor_bg",
+      "test": "test_doctor_shows_bg_section_when_state_present",
+      "classification": "TEST_HOME_ONLY_FIXTURE_ON_WINDOWS",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.install.test_version_history",
+      "test": "test_installer_clones_shallow_local_source_without_lazy_fetch_recursion[powershell-file-url]",
+      "classification": "WINDOWS_INSTALLER_FILE_URL_FAILURE",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.prompt.test_persona_scope",
+      "test": "test_named_persona_resolves_to_personas_dir",
+      "classification": "TEST_PATH_SEPARATOR_SYNTAX",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.recipes.test_compose.TestLoadOperatorRecipe",
+      "test": "test_external_prompt_file",
+      "classification": "TEST_TOML_WINDOWS_BACKSLASH_ESCAPE",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.server.test_connectors_router",
+      "test": "test_connect_news_rss_requires_and_persists_feeds",
+      "classification": "TEST_LIVE_DNS_IN_MOCKED_CONFIGURATION_CONTRACT",
+      "baseline_reproduction": "FAILED with controlled DNS outage; isolated current test passed when DNS returned",
+      "post_full_repair": "test-only controlled public DNS plus explicit DNS-failure refusal test; production unchanged"
+    },
+    {
+      "class": "tests.skills.test_integration_live.TestSkillSystemIntegration",
+      "test": "test_system_builder_discovers_skills",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.skills.test_integration_live.TestSkillSystemIntegration",
+      "test": "test_skill_catalog_in_system_prompt",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.skills.test_integration_live.TestSkillSystemIntegration",
+      "test": "test_skill_tool_invocation_returns_content",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.skills.test_integration_live.TestSkillSystemIntegration",
+      "test": "test_agent_ask_with_skills_available",
+      "classification": "LIVE_DEPENDENCY_CREDENTIAL_MODEL_OR_CATALOG",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.telemetry.test_energy_rapl.TestDomainDiscovery",
+      "test": "test_discovers_domains_from_sysfs",
+      "classification": "TEST_LINUX_SYSFS_COLON_NAMES",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.telemetry.test_energy_rapl.TestSampleNormalDelta",
+      "test": "test_normal_counter_delta",
+      "classification": "TEST_LINUX_SYSFS_COLON_NAMES",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.telemetry.test_energy_rapl.TestSampleWrapAround",
+      "test": "test_counter_wrap_around",
+      "classification": "TEST_LINUX_SYSFS_COLON_NAMES",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.telemetry.test_energy_rapl.TestSampleDomainCategorization",
+      "test": "test_package_domains_categorized_as_cpu",
+      "classification": "TEST_LINUX_SYSFS_COLON_NAMES",
+      "baseline_reproduction": "FAILED"
+    },
+    {
+      "class": "tests.telemetry.test_energy_rapl.TestClose",
+      "test": "test_close_clears_domains",
+      "classification": "TEST_LINUX_SYSFS_COLON_NAMES",
+      "baseline_reproduction": "FAILED"
+    }
+  ],
+  "post_full_test_only_change": "RSS configuration contract controls DNS and adds failure refusal coverage; focused regression recorded separately; no production changes after full run; full counts not recomputed or adjusted"
+}
