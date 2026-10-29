@@ -16,6 +16,7 @@ from openjarvis.agents.tool_resolver import ResolvedAgentTools
 from openjarvis.connectors.store import KnowledgeStore
 from openjarvis.core.config import MemoryFilesConfig, SystemPromptConfig
 from openjarvis.core.events import EventBus, EventType
+from openjarvis.core.execution import ToolEffect
 from openjarvis.core.registry import AgentRegistry, ToolRegistry
 from openjarvis.core.types import Role, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -80,7 +81,16 @@ class _ExecutorProbeTool(BaseTool):
 
     @property
     def spec(self) -> ToolSpec:
-        return ToolSpec(name=self.tool_id, description="Executor parity probe")
+        return ToolSpec(
+            name=self.tool_id,
+            description="Executor parity probe",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.MUTATING,
+        )
 
     def execute(self, **params) -> ToolResult:
         type(self).calls += 1
@@ -141,7 +151,13 @@ class _PrivilegedExecutorProbeTool(BaseTool):
         return ToolSpec(
             name=self.tool_id,
             description="Managed-agent enforcement probe",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
             required_capabilities=["code:execute"],
+            effect=ToolEffect.MUTATING,
         )
 
     def execute(self, **params) -> ToolResult:

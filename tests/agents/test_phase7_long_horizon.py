@@ -28,6 +28,12 @@ class _LongHorizonMutation(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-owned verified long-horizon mutation",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
             effect=ToolEffect.MUTATING,
         )
 

@@ -11,8 +11,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-PLAN_SCHEMA_VERSION = 2
-_LEGACY_PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 3
+_LEGACY_PLAN_SCHEMA_VERSIONS = frozenset({1, 2})
 PLAN_NODE_STATES = frozenset(
     {
         "PLANNED",
@@ -58,6 +58,10 @@ class DurablePlanNode:
     dependencies: list[str] = field(default_factory=list)
     mutation_intent_id: str | None = None
     superseded_by: str | None = None
+    tool_name: str | None = None
+    arguments_sha256: str | None = None
+    schema_version: int | None = None
+    resource_identity: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -86,6 +90,25 @@ class DurablePlanNode:
             not isinstance(self.superseded_by, str) or not self.superseded_by.strip()
         ):
             raise ValueError("superseded_by must be nonempty when present")
+        if self.tool_name is not None and (
+            not isinstance(self.tool_name, str) or not self.tool_name.strip()
+        ):
+            raise ValueError("tool_name must be nonempty when present")
+        if self.arguments_sha256 is not None and (
+            not isinstance(self.arguments_sha256, str)
+            or len(self.arguments_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.arguments_sha256)
+        ):
+            raise ValueError("arguments_sha256 must be a lowercase SHA-256 digest")
+        if self.schema_version is not None and (
+            type(self.schema_version) is not int or self.schema_version <= 0
+        ):
+            raise ValueError("schema_version must be a positive integer when present")
+        if self.resource_identity is not None and (
+            not isinstance(self.resource_identity, dict)
+            or any(not isinstance(key, str) for key in self.resource_identity)
+        ):
+            raise ValueError("resource_identity must be a string-keyed object")
         if self.status == "SUPERSEDED" and self.superseded_by is None:
             raise ValueError("superseded planner node needs a replacement")
 
@@ -97,6 +120,10 @@ class DurablePlanNode:
             "dependencies": list(self.dependencies),
             "mutation_intent_id": self.mutation_intent_id,
             "superseded_by": self.superseded_by,
+            "tool_name": self.tool_name,
+            "arguments_sha256": self.arguments_sha256,
+            "schema_version": self.schema_version,
+            "resource_identity": self.resource_identity,
         }
 
     @classmethod
@@ -110,6 +137,10 @@ class DurablePlanNode:
             dependencies=list(raw.get("dependencies", [])),
             mutation_intent_id=raw.get("mutation_intent_id"),
             superseded_by=raw.get("superseded_by"),
+            tool_name=raw.get("tool_name"),
+            arguments_sha256=raw.get("arguments_sha256"),
+            schema_version=raw.get("schema_version"),
+            resource_identity=raw.get("resource_identity"),
         )
 
 
@@ -190,6 +221,9 @@ class DurablePlan:
     revision_reason: str = "INITIAL_PLAN"
     revision_proposal_id: str | None = None
     revisions: list[PlanRevision] = field(default_factory=list)
+    tool_binding_required: bool = False
+    argument_binding_required: bool = False
+    schema_binding_required: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_id, str) or not self.execution_id.strip():
@@ -214,6 +248,10 @@ class DurablePlan:
             raise ValueError("revision_proposal_id must be nonempty when present")
         if self.status not in PLAN_STATES:
             raise ValueError("invalid plan state")
+        if type(self.tool_binding_required) is not bool or type(
+            self.argument_binding_required
+        ) is not bool or type(self.schema_binding_required) is not bool:
+            raise ValueError("plan binding flags must be booleans")
         if not isinstance(self.nodes, dict):
             raise ValueError("plan nodes must be an object")
         for key, node in self.nodes.items():
@@ -221,6 +259,17 @@ class DurablePlan:
                 raise ValueError("planner node key disagrees with its identity")
             if any(dependency not in self.nodes for dependency in node.dependencies):
                 raise ValueError("planner node dependency is missing")
+        remaining = {
+            node_id: set(node.dependencies) for node_id, node in self.nodes.items()
+        }
+        while remaining:
+            ready = {node_id for node_id, deps in remaining.items() if not deps}
+            if not ready:
+                raise ValueError("planner node dependencies contain a cycle")
+            for node_id in ready:
+                remaining.pop(node_id)
+            for deps in remaining.values():
+                deps.difference_update(ready)
         if self.active_node_id is not None and self.active_node_id not in self.nodes:
             raise ValueError("active planner node is missing")
         if self.active_node_id is not None and (
@@ -273,7 +322,10 @@ class DurablePlan:
         if not isinstance(raw, dict):
             raise ValueError("durable plan must be an object")
         schema_version = raw.get("schema_version")
-        if schema_version not in {PLAN_SCHEMA_VERSION, _LEGACY_PLAN_SCHEMA_VERSION}:
+        if type(schema_version) is not int or schema_version not in {
+            PLAN_SCHEMA_VERSION,
+            *_LEGACY_PLAN_SCHEMA_VERSIONS,
+        }:
             raise ValueError("unsupported durable plan schema")
         raw_nodes = raw.get("nodes", [])
         if not isinstance(raw_nodes, list):
@@ -316,6 +368,9 @@ class DurablePlan:
             revision_reason=raw.get("revision_reason", "INITIAL_PLAN"),
             revision_proposal_id=raw.get("revision_proposal_id"),
             revisions=revisions,
+            tool_binding_required=raw.get("tool_binding_required", False),
+            argument_binding_required=raw.get("argument_binding_required", False),
+            schema_binding_required=raw.get("schema_binding_required", False),
         )
 
     def _current_revision(self) -> PlanRevision:
@@ -340,6 +395,9 @@ class DurablePlan:
             "parent_revision_id": self.parent_revision_id,
             "revision_reason": self.revision_reason,
             "revision_proposal_id": self.revision_proposal_id,
+            "tool_binding_required": self.tool_binding_required,
+            "argument_binding_required": self.argument_binding_required,
+            "schema_binding_required": self.schema_binding_required,
             "status": self.status,
             "active_node_id": self.active_node_id,
             "nodes": [self.nodes[node_id].to_dict() for node_id in sorted(self.nodes)],
@@ -398,6 +456,10 @@ class DurablePlan:
         planner_node_id: str | None = None,
         kind: str = "MUTATING",
         dependencies: list[str] | None = None,
+        tool_name: str | None = None,
+        arguments_sha256: str | None = None,
+        schema_version: int | None = None,
+        resource_identity: dict[str, Any] | None = None,
     ) -> DurablePlanNode:
         node_id = planner_node_id or _new_id("node")
         if node_id in self.nodes:
@@ -409,6 +471,10 @@ class DurablePlan:
             planner_node_id=node_id,
             kind=kind,
             dependencies=deps,
+            tool_name=tool_name,
+            arguments_sha256=arguments_sha256,
+            schema_version=schema_version,
+            resource_identity=resource_identity,
         )
         self.nodes[node_id] = node
         self.revision = max(1, self.revision + 1)

@@ -69,6 +69,7 @@ class MutationIntent:
     execution_id: str
     step_id: str
     mutation_intent_id: str
+    arguments_sha256: str | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -78,10 +79,19 @@ class MutationIntent:
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Mutation intent {name} must be nonempty")
+        if self.arguments_sha256 is not None and (
+            not isinstance(self.arguments_sha256, str)
+            or len(self.arguments_sha256) != 64
+            or any(char not in "0123456789abcdef" for char in self.arguments_sha256)
+        ):
+            raise ValueError("Mutation intent arguments hash is invalid")
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        result = {
             "execution_id": self.execution_id,
             "step_id": self.step_id,
             "mutation_intent_id": self.mutation_intent_id,
         }
+        if self.arguments_sha256 is not None:
+            result["arguments_sha256"] = self.arguments_sha256
+        return result

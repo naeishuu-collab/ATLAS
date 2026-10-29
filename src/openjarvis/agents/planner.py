@@ -38,6 +38,7 @@ _PLAN_SCHEMA = {
                     "tool_name": {"type": "string", "minLength": 1},
                     "arguments": {},
                     "dependencies": {"type": "array", "items": {"type": "string"}},
+                    "schema_version": {"type": ["integer", "null"], "minimum": 1},
                 },
             },
         },
@@ -47,8 +48,9 @@ _PLAN_SCHEMA = {
 
 _SYSTEM_PROMPT = """Return exactly one JSON object describing a proposed execution plan.
 The object may contain proposal_id, source, model_turn, and steps. Each step has
-local_index, kind (READ_ONLY or MUTATING), tool_name, optional arguments, and
-optional dependencies. Do not include controller identity or completion fields.
+local_index, kind (READ_ONLY or MUTATING), tool_name, optional arguments,
+optional dependencies, and optional schema_version. Do not include controller
+identity or completion fields.
 The response is a proposal only; a controller will validate and materialize it."""
 
 _REPLAN_SYSTEM_PROMPT = """Return exactly one JSON object describing a proposed

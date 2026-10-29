@@ -68,7 +68,20 @@ class _WindowsCheckpointTool(BaseTool):
 
     @property
     def spec(self):
-        return ToolSpec(self.tool_id, "fixture action", effect=ToolEffect.MUTATING)
+        return ToolSpec(
+            self.tool_id,
+            "fixture action",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "observation_id": {"type": "string"},
+                    "target_id": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.MUTATING,
+        )
 
     def execute(self, action="click", observation_id="", target_id="", **params):
         type(self).calls += 1

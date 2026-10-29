@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from openjarvis.core.execution import MutationIntent
@@ -69,6 +69,7 @@ class PlanStepProposal:
     tool_name: str
     arguments: Any = "{}"
     dependencies: tuple[str, ...] = ()
+    schema_version: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.local_index, str) or not self.local_index.strip():
@@ -91,6 +92,12 @@ class PlanStepProposal:
                 "PLAN_PROPOSAL_REJECTED: duplicate dependency reference"
             )
         object.__setattr__(self, "dependencies", dependencies)
+        if self.schema_version is not None and (
+            type(self.schema_version) is not int or self.schema_version <= 0
+        ):
+            raise PlanProposalError(
+                "PLAN_PROPOSAL_REJECTED: invalid schema_version"
+            )
         reserved = _reserved_fields(self.arguments)
         if reserved:
             fields = ", ".join(reserved)
@@ -110,7 +117,14 @@ class PlanStepProposal:
                 "PLAN_PROPOSAL_REJECTED: authority fields are not accepted "
                 f"({fields})"
             )
-        allowed = {"local_index", "kind", "tool_name", "arguments", "dependencies"}
+        allowed = {
+            "local_index",
+            "kind",
+            "tool_name",
+            "arguments",
+            "dependencies",
+            "schema_version",
+        }
         unknown = set(raw) - allowed
         if unknown:
             raise PlanProposalError(
@@ -128,6 +142,7 @@ class PlanStepProposal:
             tool_name=raw.get("tool_name", ""),
             arguments=raw.get("arguments", "{}"),
             dependencies=tuple(dependencies),
+            schema_version=raw.get("schema_version"),
         )
 
 
@@ -288,6 +303,7 @@ class ProposalDecision:
     mutation_context: MutationIntent | None = None
     code: str = ""
     message: str = ""
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 __all__ = [

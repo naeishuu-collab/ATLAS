@@ -112,6 +112,14 @@ All tool-using agents (`OrchestratorAgent`, `NativeReActAgent`, `NativeOpenHands
 
 ---
 
+## Durable Managed Goal Execution
+
+Managed-agent goals can use `AgentExecutor` to persist a controller-owned plan across steps and checkpoints. Planner output is an untrusted proposal; the host materializes it only after validating each tool against its registered `ToolSpec`.
+
+For every planned step, the controller binds the tool name, canonical arguments, schema version, effect, resource identity, and required capabilities. Tool dispatch continues through the existing host authorization and mutation-intent boundary. A mutation with `UNKNOWN_OUTCOME` remains blocked until reconciliation establishes its state.
+
+A step is complete only after the execution journal reports `VERIFIED`. Final goal acceptance separately checks the durable plan and expected artifact content; missing or unavailable evidence is not success. This controller is distinct from the ordinary `ToolUsingAgent` loop described above.
+
 ## Choosing an Agent
 
 Start here. Pick the simplest agent that handles your task — simpler agents are faster, use fewer tokens, and are easier to debug. Reach for more complex agents only when the task demands it.

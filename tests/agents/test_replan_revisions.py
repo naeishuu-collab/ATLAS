@@ -311,7 +311,7 @@ def test_c14_identical_future_action_gets_a_fresh_intent(tmp_path):
             for node in accepted["plan"]["nodes"]
             if node["status"] == "PLANNED"
         )
-        _run(manager, agent["id"], [_call("same-action"), {"content": "done"}])
+        _run(manager, agent["id"], [_call("same-action", "ok"), {"content": "done"}])
         final = _plan(manager, agent["id"])
         assert _PlanProposalMutationTool.calls == 2
         assert _node(final, replacement["planner_node_id"])["status"] == "COMPLETED"
@@ -458,7 +458,11 @@ def test_cc3_cc4_restart_after_accept_and_activation_keeps_one_identity(tmp_path
         after = _plan(restarted, agent["id"])
         active = _node(after, replacement["planner_node_id"])
         assert active["status"] == "PLANNED"
-        _run(restarted, agent["id"], [_call("replacement"), {"content": "done"}])
+        _run(
+            restarted,
+            agent["id"],
+            [_call("replacement", "replacement"), {"content": "done"}],
+        )
         restored = _plan(restarted, agent["id"])
         assert _node(restored, replacement["planner_node_id"])["status"] == "COMPLETED"
     finally:
@@ -472,7 +476,11 @@ def test_cc5_replacement_verified_is_not_replayed_after_restart(tmp_path):
     replacement = next(
         node for node in accepted["plan"]["nodes"] if node["status"] == "PLANNED"
     )
-    _run(manager, agent["id"], [_call("replacement"), {"content": "done"}])
+    _run(
+        manager,
+        agent["id"],
+        [_call("replacement", "replacement"), {"content": "done"}],
+    )
     assert _PlanProposalMutationTool.calls == 2
     restarted = _restart(manager, agent["id"], path)
     try:

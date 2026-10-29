@@ -202,9 +202,11 @@ class OrchestratorAgent(ToolUsingAgent):
                 "proposal": {
                     "provider_call_id": call.id,
                     "failure": decision.code,
+                    "details": decision.details,
                 },
                 "plan": {
                     "failure": decision.code,
+                    "details": decision.details,
                     "mutation_dispatched": False,
                 },
                 "execution": outcome.to_dict(),
@@ -342,7 +344,13 @@ class OrchestratorAgent(ToolUsingAgent):
                 active.update(
                     {
                         key: semantic[key]
-                        for key in ("execution_id", "step_id", "mutation_intent_id")
+                        for key in (
+                            "execution_id",
+                            "step_id",
+                            "mutation_intent_id",
+                            "arguments_sha256",
+                        )
+                        if key in semantic
                     }
                 )
                 active["semantic_status"] = semantic["status"]
@@ -783,7 +791,13 @@ class OrchestratorAgent(ToolUsingAgent):
                 active.update(
                     {
                         key: semantic[key]
-                        for key in ("execution_id", "step_id", "mutation_intent_id")
+                        for key in (
+                            "execution_id",
+                            "step_id",
+                            "mutation_intent_id",
+                            "arguments_sha256",
+                        )
+                        if key in semantic
                     }
                 )
                 active["semantic_status"] = semantic["status"]

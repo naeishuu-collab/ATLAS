@@ -29,6 +29,11 @@ class _ManagedMutationTool(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-only managed mutation",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
             effect=ToolEffect.MUTATING,
         )
 

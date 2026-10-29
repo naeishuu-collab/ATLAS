@@ -178,7 +178,7 @@ def test_p3d_b9_b10_b11_trusted_progression_needs_no_planner_call(tmp_path):
         AgentExecutor(
             manager, EventBus(), system=FakeSystem(FakeEngine([]))
         ).advance_materialized_plan_node(agent["id"], planner_node_id=s2)
-        _run(manager, agent["id"], [_call("s2"), {"content": "done"}])
+        _run(manager, agent["id"], [_call("s2", "two"), {"content": "done"}])
         assert planner.call_count == 1
         assert _PlanProposalMutationTool.calls == 2
     finally:

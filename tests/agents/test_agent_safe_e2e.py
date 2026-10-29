@@ -78,7 +78,7 @@ def test_e2e_two_step_goal_verifies_end_to_end(tmp_path) -> None:
             agent["id"],
             planner_node_id=mat["local_to_planner_node"]["s2"],
         )
-        _run(manager, agent["id"], [_call("s2"), {"content": "s2 done"}])
+        _run(manager, agent["id"], [_call("s2", "two"), {"content": "s2 done"}])
         plan = _plan(manager, agent["id"])
         by_node = {n["planner_node_id"]: n["status"] for n in plan["nodes"]}
         assert by_node[mat["local_to_planner_node"]["s1"]] == "COMPLETED"

@@ -60,8 +60,17 @@ class _UnknownTool(BaseTool):
 
     @property
     def spec(self) -> ToolSpec:
-        return ToolSpec(self.tool_id, "unknown-outcome mutation",
-                        effect=ToolEffect.MUTATING)
+        return ToolSpec(
+            self.tool_id,
+            "unknown-outcome mutation",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.MUTATING,
+        )
 
     def execute(self, **params):
         type(self).calls += 1
@@ -74,8 +83,17 @@ class _CountingTool(BaseTool):
 
     @property
     def spec(self) -> ToolSpec:
-        return ToolSpec(self.tool_id, "test-only mutation",
-                        effect=ToolEffect.MUTATING)
+        return ToolSpec(
+            self.tool_id,
+            "test-only mutation",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.MUTATING,
+        )
 
     def execute(self, **params):
         type(self).calls += 1

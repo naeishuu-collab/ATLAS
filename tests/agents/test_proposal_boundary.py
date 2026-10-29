@@ -31,6 +31,11 @@ class _ProposalMutationTool(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-only managed mutation",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": False,
+            },
             effect=ToolEffect.MUTATING,
         )
 
@@ -54,6 +59,11 @@ class _ProposalReadTool(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-only read",
+            parameters={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
             effect=ToolEffect.READ_ONLY,
         )
 

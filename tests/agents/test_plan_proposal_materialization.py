@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -28,19 +30,44 @@ class _PlanProposalMutationTool(BaseTool):
     tool_id = "phase3d_plan_proposal_mutation"
     calls = 0
     unknown = False
+    artifact_output: str | None = None
 
     @property
     def spec(self) -> ToolSpec:
-        return ToolSpec(self.tool_id, "test-only mutation", effect=ToolEffect.MUTATING)
+        return ToolSpec(
+            self.tool_id,
+            "test-only mutation",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.MUTATING,
+        )
 
     def execute(self, **params):
         type(self).calls += 1
         if type(self).unknown:
             raise RuntimeError("response lost after simulated dispatch")
+        metadata = {}
+        if type(self).artifact_output and params.get("value") == "three":
+            content = b"verified final artifact"
+            path = Path(type(self).artifact_output)
+            path.write_bytes(content)
+            metadata["artifacts"] = [
+                {
+                    "type": "file",
+                    "path": str(path.resolve()),
+                    "size_bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            ]
         return ToolResult(
             self.tool_id,
             json.dumps({"value": params.get("value", "ok")}),
             execution_state=ExecutionState.VERIFIED,
+            metadata=metadata,
         )
 
 
@@ -64,7 +91,7 @@ def _agent(manager: AgentManager) -> dict:
     )
 
 
-def _call(call_id: str, value: str = "ok") -> dict:
+def _call(call_id: str, value: str = "one") -> dict:
     return {
         "tool_calls": [
             {
@@ -160,6 +187,94 @@ def test_p3d_a1_a8_materializes_trusted_plan_and_only_activates_s1(tmp_path):
         assert s2["status"] == "PLANNED"
         assert s2["dependencies"] == [result["local_to_planner_node"]["s1"]]
         assert all(node["mutation_intent_id"] is None for node in nodes)
+    finally:
+        manager.close()
+
+
+def test_goal_planning_auto_advances_only_the_unique_verified_successor(tmp_path):
+    _PlanProposalMutationTool.calls = 0
+    artifact_path = tmp_path / "goal-artifact.txt"
+    _PlanProposalMutationTool.artifact_output = str(artifact_path)
+    manager = AgentManager(str(tmp_path / "automatic-progression.db"))
+    agent = _agent(manager)
+    try:
+        manager.update_agent(
+            agent["id"], config={**agent["config"], "goal_planning": {"enabled": True}}
+        )
+        _ready(manager, agent["id"])
+        proposal = _proposal()
+        proposal = PlanProposal(
+            proposal_id=proposal.proposal_id,
+            steps=(
+                *proposal.steps,
+                PlanStepProposal(
+                    "s3",
+                    "MUTATING",
+                    _PlanProposalMutationTool.tool_id,
+                    arguments={"value": "three"},
+                    dependencies=("s2",),
+                ),
+            ),
+        )
+        materialized = _materialize(manager, agent["id"], proposal)
+        _run(
+            manager,
+            agent["id"],
+            [
+                _call("auto-s1", "one"),
+                _call("auto-s2", "two"),
+                _call("auto-s3", "three"),
+                {"content": "done"},
+            ],
+        )
+        assert _PlanProposalMutationTool.calls == 3
+        final_plan = _plan(manager, agent["id"])
+        assert len(final_plan["nodes"]) == 3
+        assert all(node["status"] == "COMPLETED" for node in final_plan["nodes"])
+        assert final_plan["active_node_id"] is None
+        assert materialized["plan_id"] == final_plan["plan_id"]
+        acceptance = AgentExecutor(
+            manager, EventBus(), system=FakeSystem(FakeEngine([]))
+        ).verify_goal_acceptance(agent["id"])
+        assert acceptance["status"] == "VERIFIED"
+        assert (
+            acceptance["evidence"][0]["actual_sha256"]
+            == hashlib.sha256(b"verified final artifact").hexdigest()
+        )
+    finally:
+        _PlanProposalMutationTool.artifact_output = None
+        manager.close()
+
+
+def test_invalid_tool_arguments_fail_before_dispatch(tmp_path):
+    _PlanProposalMutationTool.calls = 0
+    manager = AgentManager(str(tmp_path / "invalid-tool-arguments.db"))
+    agent = _agent(manager)
+    try:
+        _ready(manager, agent["id"])
+        engine = _run(
+            manager,
+            agent["id"],
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wrong-type",
+                            "name": _PlanProposalMutationTool.tool_id,
+                            "arguments": json.dumps({"value": 1}),
+                        }
+                    ]
+                }
+            ],
+        )
+        assert _PlanProposalMutationTool.calls == 0
+        assert manager.execution_journal.pending(agent["id"]) == []
+        assert _plan(manager, agent["id"])["nodes"] == []
+        assert any(
+            "TOOL_ARGUMENT_TYPE" in message.content
+            for message in engine.last_messages or []
+            if message.role.value == "tool"
+        )
     finally:
         manager.close()
 
@@ -261,8 +376,18 @@ def test_p3d_a7_ambiguous_frontier_fails_closed(tmp_path):
         proposal = PlanProposal(
             "ambiguous",
             (
-                PlanStepProposal("s1", "MUTATING", _PlanProposalMutationTool.tool_id),
-                PlanStepProposal("s2", "MUTATING", _PlanProposalMutationTool.tool_id),
+                PlanStepProposal(
+                    "s1",
+                    "MUTATING",
+                    _PlanProposalMutationTool.tool_id,
+                    arguments={"value": "one"},
+                ),
+                PlanStepProposal(
+                    "s2",
+                    "MUTATING",
+                    _PlanProposalMutationTool.tool_id,
+                    arguments={"value": "two"},
+                ),
             ),
         )
         with pytest.raises(PlanProposalError, match="AMBIGUOUS_PLAN_FRONTIER"):
@@ -617,7 +742,7 @@ def test_p3d_ac4_crash_after_s2_activation_reuses_s2_intent(tmp_path):
     )
     restarted = _restart(manager, agent["id"], path)
     try:
-        _run(restarted, agent["id"], [_call("s2-call"), {"content": "done"}])
+        _run(restarted, agent["id"], [_call("s2-call", "two"), {"content": "done"}])
         assert _PlanProposalMutationTool.calls == 2
         plan = _plan(restarted, agent["id"])
         assert plan["nodes"][1]["status"] == "COMPLETED"

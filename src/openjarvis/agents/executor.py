@@ -27,6 +27,13 @@ from openjarvis.agents.proposals import (
     ToolExecutionProposal,
 )
 from openjarvis.agents.tool_resolver import resolve_agent_tools
+from openjarvis.agents.tool_semantics import (
+    ToolSemanticBinding,
+    ToolSemanticError,
+    arguments_sha256,
+    validate_tool_arguments,
+)
+from openjarvis.agents.verification import GoalVerification, verify_goal_artifacts
 from openjarvis.core.artifacts import is_artifact_reference, valid_artifact_references
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.execution import MutationIntent, ToolRequirement
@@ -72,11 +79,24 @@ _SEMANTIC_STEP_STATES = {
 class _ManagedMutationController:
     """Controller-owned plan and semantic identity for one managed execution."""
 
-    def __init__(self, journal: Any, scope: str, runtime: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        journal: Any,
+        scope: str,
+        runtime: dict[str, Any],
+        *,
+        tool_specs: dict[str, Any] | None = None,
+        authorization_check: Any = None,
+        strict_schema: bool = False,
+    ) -> None:
         self._journal = journal
         self._scope = scope
         self._runtime = runtime
         self._tool_state = runtime.setdefault("tool_state", {})
+        self._tool_specs = dict(tool_specs or {})
+        self._authorization_check = authorization_check
+        self._strict_schema = bool(strict_schema)
+        self._auto_advance = runtime.get("_auto_advance_plan") is True
         execution_id = self._tool_state.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id.strip():
             execution_id = uuid.uuid4().hex
@@ -126,6 +146,7 @@ class _ManagedMutationController:
                             "execution_id": step["execution_id"],
                             "step_id": step["step_id"],
                             "mutation_intent_id": step["mutation_intent_id"],
+                            "arguments_sha256": step.get("arguments_sha256"),
                             "status": step.get(
                                 "semantic_status",
                                 step.get("execution_state", ""),
@@ -145,7 +166,10 @@ class _ManagedMutationController:
         if raw["status"] not in _SEMANTIC_STEP_STATES:
             raise ValueError("managed semantic step state is invalid")
         intent = MutationIntent(
-            raw["execution_id"], raw["step_id"], raw["mutation_intent_id"]
+            raw["execution_id"],
+            raw["step_id"],
+            raw["mutation_intent_id"],
+            raw.get("arguments_sha256"),
         )
         row = self._journal.semantic_intent(self._scope, intent)
         if row is None:
@@ -162,6 +186,10 @@ class _ManagedMutationController:
             self._plan.activate(intent.step_id)
         if node.kind != "MUTATING":
             raise ValueError("managed semantic step is bound to a read-only node")
+        if self._plan.argument_binding_required and (
+            intent.arguments_sha256 != node.arguments_sha256
+        ):
+            raise ValueError("PLAN_ARGUMENT_BINDING_MISMATCH")
         if node.mutation_intent_id not in {None, intent.mutation_intent_id}:
             raise ValueError("planner node mutation intent disagrees")
         if node.status == "PLANNED":
@@ -236,6 +264,9 @@ class _ManagedMutationController:
                 self._execution_id,
                 step_id,
                 f"intent-{uuid.uuid4().hex}",
+                node.arguments_sha256
+                if self._plan.argument_binding_required
+                else None,
             )
             self._journal.authorize_intent(self._scope, intent)
             self._intent = intent
@@ -251,6 +282,131 @@ class _ManagedMutationController:
             self._sync_plan_state()
             self._write()
         return self._intent
+
+    def _tool_instance(self, tool_name: str) -> Any:
+        instance = self._tool_specs.get(tool_name)
+        if instance is not None:
+            return instance
+        try:
+            from openjarvis.core.registry import ToolRegistry
+
+            entry = ToolRegistry.get(tool_name)
+            return entry() if isinstance(entry, type) else entry
+        except Exception:
+            return None
+
+    def _tool_spec(self, tool_name: str) -> Any:
+        instance = self._tool_instance(tool_name)
+        return getattr(instance, "spec", instance)
+
+    def _tool_capabilities(self, tool_name: str) -> tuple[str, ...]:
+        instance = self._tool_instance(tool_name)
+        if instance is None or not hasattr(instance, "spec"):
+            return ()
+        from openjarvis.security.capabilities import canonical_tool_capabilities
+
+        return tuple(canonical_tool_capabilities(instance))
+
+    def _semantic_binding(
+        self,
+        proposal: ToolExecutionProposal,
+        *,
+        effect: str,
+        expected_schema_version: int | None = None,
+        expected_resource_identity: dict[str, Any] | None = None,
+    ) -> ToolSemanticBinding:
+        spec = self._tool_spec(proposal.tool_name)
+        if spec is None:
+            if not self._strict_schema:
+                return ToolSemanticBinding(
+                    tool_name=proposal.tool_name,
+                    schema_version=1,
+                    effect=effect,
+                    arguments_sha256=arguments_sha256(proposal.arguments),
+                    resource_identity={},
+                )
+            raise ToolSemanticError(
+                "TOOL_SCHEMA_UNAVAILABLE",
+                "trusted tool schema is unavailable",
+                actual=proposal.tool_name,
+            )
+        authorization_check = self._authorization_check
+        return validate_tool_arguments(
+            spec,
+            proposal.arguments,
+            expected_effect=effect,
+            expected_schema_version=expected_schema_version,
+            expected_resource_identity=expected_resource_identity,
+            authorization_check=authorization_check,
+            required_capabilities=self._tool_capabilities(proposal.tool_name),
+        )
+
+    def _plan_step_binding(self, step: Any) -> ToolSemanticBinding:
+        spec = self._tool_spec(step.tool_name)
+        if spec is None:
+            if not self._strict_schema:
+                return ToolSemanticBinding(
+                    tool_name=step.tool_name,
+                    schema_version=1,
+                    effect=step.kind,
+                    arguments_sha256=arguments_sha256(step.arguments),
+                    resource_identity={},
+                )
+            raise ToolSemanticError(
+                "TOOL_SCHEMA_UNAVAILABLE",
+                "trusted tool schema is unavailable",
+                actual=step.tool_name,
+            )
+        return validate_tool_arguments(
+            spec,
+            step.arguments,
+            expected_effect=step.kind,
+            expected_schema_version=step.schema_version,
+            authorization_check=self._authorization_check,
+            required_capabilities=self._tool_capabilities(step.tool_name),
+        )
+
+    @staticmethod
+    def _bind_node(node: Any, binding: ToolSemanticBinding) -> None:
+        if node.tool_name is not None and node.tool_name != binding.tool_name:
+            raise ToolSemanticError(
+                "PLAN_TOOL_MISMATCH",
+                "proposed tool does not match the controller-bound plan node",
+                expected=node.tool_name,
+                actual=binding.tool_name,
+            )
+        if (
+            node.arguments_sha256 is not None
+            and node.arguments_sha256 != binding.arguments_sha256
+        ):
+            raise ToolSemanticError(
+                "PLAN_ARGUMENT_MISMATCH",
+                "proposed arguments do not match the controller-bound plan node",
+            )
+        if (
+            node.schema_version is not None
+            and node.schema_version != binding.schema_version
+        ):
+            raise ToolSemanticError(
+                "PLAN_SCHEMA_VERSION_MISMATCH",
+                "proposed schema version does not match the controller-bound plan node",
+                expected=node.schema_version,
+                actual=binding.schema_version,
+            )
+        if (
+            node.resource_identity is not None
+            and node.resource_identity != binding.resource_identity
+        ):
+            raise ToolSemanticError(
+                "PLAN_RESOURCE_MISMATCH",
+                "proposed resource does not match the controller-bound plan node",
+                expected=node.resource_identity,
+                actual=binding.resource_identity,
+            )
+        node.tool_name = binding.tool_name
+        node.arguments_sha256 = binding.arguments_sha256
+        node.schema_version = binding.schema_version
+        node.resource_identity = dict(binding.resource_identity)
 
     def authorize_proposal(
         self,
@@ -269,22 +425,24 @@ class _ManagedMutationController:
                     f"accepted ({fields})."
                 ),
             )
-        if effect == "READ_ONLY":
-            return ProposalDecision(allowed=True)
         try:
+            binding = self._semantic_binding(proposal, effect=effect)
             if self._intent is not None:
                 self.refresh()
                 if self._status == "VERIFIED":
-                    return ProposalDecision(
-                        allowed=False,
-                        code="PLAN_ADVANCEMENT_REQUIRED",
-                        message=(
-                            "PLAN_ADVANCEMENT_REQUIRED: the current mutation step "
-                            "is already VERIFIED; a trusted controller step is "
-                            "required before another mutation."
-                        ),
-                    )
-                if self._status in {
+                    if effect != "READ_ONLY" and not (
+                        self._auto_advance and self._advance_verified_step()
+                    ):
+                        return ProposalDecision(
+                            allowed=False,
+                            code="PLAN_ADVANCEMENT_REQUIRED",
+                            message=(
+                                "PLAN_ADVANCEMENT_REQUIRED: the current mutation "
+                                "step is already VERIFIED; a trusted controller "
+                                "step is required before another proposal."
+                            ),
+                        )
+                if effect != "READ_ONLY" and self._status in {
                     "PREPARED",
                     "EXECUTING",
                     "EXECUTED",
@@ -298,7 +456,7 @@ class _ManagedMutationController:
                             "is unresolved; no replacement mutation is allowed."
                         ),
                     )
-                if self._status in {"FAILED", "NOT_EXECUTED"}:
+                if effect != "READ_ONLY" and self._status in {"FAILED", "NOT_EXECUTED"}:
                     return ProposalDecision(
                         allowed=False,
                         code="PLAN_ADVANCEMENT_REQUIRED",
@@ -307,8 +465,70 @@ class _ManagedMutationController:
                             "execute; a trusted controller replan is required."
                         ),
                     )
+            if (
+                self._auto_advance
+                and self._plan.nodes
+                and self._plan.active_node_id is None
+            ):
+                self._advance_ready_step()
+            planned_node_id = (
+                self._intent.step_id
+                if self._intent is not None
+                else self._next_step_id or self._plan.active_node_id
+            )
+            planned_node = (
+                self._plan.node(planned_node_id)
+                if isinstance(planned_node_id, str)
+                else None
+            )
+            if effect == "READ_ONLY":
+                if planned_node is not None and planned_node.kind == "READ_ONLY":
+                    self._bind_node(planned_node, binding)
+                    self._write()
+                return ProposalDecision(allowed=True)
+            if self._plan.nodes and planned_node is None:
+                return ProposalDecision(
+                    allowed=False,
+                    code="PLAN_ADVANCEMENT_REQUIRED",
+                    message=(
+                        "PLAN_ADVANCEMENT_REQUIRED: no unique controller-bound "
+                        "plan step is executable."
+                    ),
+                )
+            if planned_node is not None:
+                if (planned_node.kind == "READ_ONLY") != (effect == "READ_ONLY"):
+                    return ProposalDecision(
+                        allowed=False,
+                        code="PLAN_EFFECT_MISMATCH",
+                        message=(
+                            "PLAN_EFFECT_MISMATCH: proposed tool effect does not "
+                            "match the controller-bound plan node."
+                        ),
+                    )
+                self._bind_node(planned_node, binding)
+                self._write()
+            elif effect == "MUTATING":
+                self._plan.tool_binding_required = True
+                self._plan.argument_binding_required = True
+                self._plan.schema_binding_required = True
+                node = self._plan.add_node(
+                    kind="MUTATING",
+                    tool_name=binding.tool_name,
+                    arguments_sha256=binding.arguments_sha256,
+                    schema_version=binding.schema_version,
+                    resource_identity=binding.resource_identity,
+                )
+                self._plan.activate(node.planner_node_id)
+                self._write()
             intent = self.context_for()
             return ProposalDecision(allowed=True, mutation_context=intent)
+        except ToolSemanticError as exc:
+            return ProposalDecision(
+                allowed=False,
+                code=exc.code,
+                message=f"{exc.code}: {exc}",
+                details=exc.as_dict(),
+            )
         except ValueError as exc:
             return ProposalDecision(
                 allowed=False,
@@ -319,6 +539,13 @@ class _ManagedMutationController:
     def record_result(self, _call: ToolCall, result: Any) -> None:
         """Stage the result state in the checkpoint before continuation."""
         if self._intent is None:
+            if result is not None and getattr(result, "success", False):
+                step_id = self._next_step_id or self._plan.active_node_id
+                node = self._plan.node(step_id) if step_id else None
+                if node is not None and node.kind == "READ_ONLY":
+                    self._plan.complete_read_only(node.planner_node_id)
+                    self._next_step_id = None
+                    self._write()
             return
         execution = (getattr(result, "metadata", {}) or {}).get("execution", {})
         # A pre-dispatch failure has no reservation token.  Refresh from the
@@ -354,6 +581,51 @@ class _ManagedMutationController:
 
     def plan_snapshot(self) -> dict[str, Any]:
         return self._plan.to_dict()
+
+    def _ready_nodes(self) -> list[Any]:
+        if self._plan.active_node_id is not None:
+            return []
+        if any(
+            node.status in {"FAILED", "RECONCILIATION_REQUIRED"}
+            for node in self._plan.nodes.values()
+        ):
+            return []
+        return sorted(
+            (
+                node
+                for node in self._plan.nodes.values()
+                if node.status == "PLANNED"
+                and all(
+                    self._plan.nodes[dependency].status == "COMPLETED"
+                    for dependency in node.dependencies
+                )
+            ),
+            key=lambda node: node.planner_node_id,
+        )
+
+    def _advance_ready_step(self) -> bool:
+        """Advance only when the controller sees one unambiguous frontier."""
+        ready = self._ready_nodes()
+        if len(ready) != 1:
+            return False
+        node = ready[0]
+        self._plan.activate(node.planner_node_id)
+        self._next_step_id = node.planner_node_id
+        self._write()
+        return True
+
+    def _advance_verified_step(self) -> bool:
+        """Move a verified step to its unique controller-owned successor."""
+        ready = self._ready_nodes()
+        if len(ready) != 1:
+            return False
+        node = ready[0]
+        self._plan.activate(node.planner_node_id)
+        self._intent = None
+        self._status = None
+        self._next_step_id = node.planner_node_id
+        self._write()
+        return True
 
     def create_plan_node(
         self,
@@ -398,7 +670,6 @@ class _ManagedMutationController:
                     "PLAN_PROPOSAL_REJECTED: unsupported tools "
                     f"({', '.join(unsupported)})"
                 )
-
         local_indices = {step.local_index for step in proposal.steps}
         for step in proposal.steps:
             unknown = set(step.dependencies) - local_indices
@@ -421,6 +692,11 @@ class _ManagedMutationController:
                 remaining.pop(index)
             for deps in remaining.values():
                 deps.difference_update(ready)
+        for step in proposal.steps:
+            try:
+                self._plan_step_binding(step)
+            except ToolSemanticError as exc:
+                raise PlanProposalError(f"{exc.code}: {exc}") from exc
         return order
 
     def materialize_plan(
@@ -437,6 +713,9 @@ class _ManagedMutationController:
         order = self._validate_plan_proposal(proposal, supported_tools)
 
         candidate = DurablePlan.create(self._execution_id, self._plan.plan_id)
+        candidate.tool_binding_required = True
+        candidate.argument_binding_required = True
+        candidate.schema_binding_required = True
         local_to_node = {
             step.local_index: f"node-{uuid.uuid4().hex}" for step in proposal.steps
         }
@@ -446,10 +725,15 @@ class _ManagedMutationController:
             dependencies = [
                 local_to_node[dependency] for dependency in step.dependencies
             ]
+            binding = self._plan_step_binding(step)
             candidate.add_node(
                 planner_node_id=local_to_node[step.local_index],
                 kind=step.kind,
                 dependencies=dependencies,
+                tool_name=binding.tool_name,
+                arguments_sha256=binding.arguments_sha256,
+                schema_version=binding.schema_version,
+                resource_identity=binding.resource_identity,
             )
 
         frontier = [
@@ -541,11 +825,19 @@ class _ManagedMutationController:
             ]
             if not dependencies and local_index == roots[0]:
                 dependencies = list(old.dependencies)
+            binding = self._plan_step_binding(step)
             self._plan.add_node(
                 planner_node_id=local_to_node[local_index],
                 kind=step.kind,
                 dependencies=dependencies,
+                tool_name=binding.tool_name,
+                arguments_sha256=binding.arguments_sha256,
+                schema_version=binding.schema_version,
+                resource_identity=binding.resource_identity,
             )
+        self._plan.tool_binding_required = True
+        self._plan.argument_binding_required = True
+        self._plan.schema_binding_required = True
         self._plan.append_revision(
             reason="REPLAN", proposal_id=proposal.proposal_id
         )
@@ -851,6 +1143,26 @@ class AgentExecutor:
         """Deferred system injection — called after JarvisSystem is constructed."""
         self._system = system
 
+    def _authorization_check_for(self, agent_id: str) -> Any:
+        policy = getattr(self._system, "capability_policy", None)
+        if policy is None:
+            return None
+
+        def check(capability: str, tool_name: str) -> bool:
+            allowed = policy.check(agent_id, capability, tool_name)
+            if not allowed:
+                self._bus.publish(
+                    EventType.CAPABILITY_DENIED,
+                    {
+                        "agent_id": agent_id,
+                        "capability": capability,
+                        "tool": tool_name,
+                    },
+                )
+            return allowed
+
+        return check
+
     def plan_goal(
         self,
         agent_id: str,
@@ -1016,6 +1328,8 @@ class AgentExecutor:
             self._manager.execution_journal,
             agent_id,
             runtime,
+            authorization_check=self._authorization_check_for(agent_id),
+            strict_schema=True,
         )
         materialized = controller.materialize_plan(
             proposal,
@@ -1056,6 +1370,8 @@ class AgentExecutor:
             self._manager.execution_journal,
             agent_id,
             runtime,
+            authorization_check=self._authorization_check_for(agent_id),
+            strict_schema=True,
         )
         accepted = controller.accept_replan(
             proposal,
@@ -1154,6 +1470,72 @@ class AgentExecutor:
             "plan_id": tool_state["plan_id"],
             "planner_node_id": step_id,
         }
+
+    def verify_goal_acceptance(
+        self,
+        agent_id: str,
+        *,
+        expected_artifacts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Verify final artifacts and durable plan completion independently."""
+        checkpoint = self._manager.get_latest_checkpoint(agent_id)
+        if checkpoint is None:
+            result = GoalVerification(
+                "VERIFICATION_UNAVAILABLE",
+                reason="no checkpoint is available",
+            )
+            return result.to_dict()
+        tool_state = dict(checkpoint.get("tool_state") or {})
+        if expected_artifacts is None:
+            expected_artifacts = []
+            for step in tool_state.get("completed_steps", []):
+                if not isinstance(step, dict):
+                    continue
+                expected_artifacts.extend(
+                    item
+                    for item in step.get("artifacts", [])
+                    if is_artifact_reference(item)
+                )
+        result = verify_goal_artifacts(expected_artifacts)
+        durable_plan = tool_state.get("durable_plan")
+        if not isinstance(durable_plan, dict):
+            result = GoalVerification(
+                "VERIFICATION_UNAVAILABLE",
+                evidence=result.evidence,
+                reason="durable plan is unavailable",
+            )
+        else:
+            try:
+                plan = DurablePlan.from_dict(durable_plan)
+            except ValueError:
+                result = GoalVerification(
+                    "VERIFICATION_UNAVAILABLE",
+                    evidence=result.evidence,
+                    reason="durable plan is structurally invalid",
+                )
+            else:
+                if plan.execution_id != tool_state.get("execution_id"):
+                    result = GoalVerification(
+                        "VERIFICATION_UNAVAILABLE",
+                        evidence=result.evidence,
+                        reason="durable plan execution identity disagrees",
+                    )
+                elif plan.status != "COMPLETED" and result.status == "VERIFIED":
+                    result = GoalVerification(
+                        "PARTIAL",
+                        evidence=result.evidence,
+                        reason=(
+                            "artifacts are current but the durable plan is incomplete"
+                        ),
+                    )
+        tool_state["goal_acceptance"] = result.to_dict()
+        self._manager.save_checkpoint(
+            agent_id,
+            checkpoint["tick_id"],
+            checkpoint["conversation_state"],
+            tool_state,
+        )
+        return result.to_dict()
 
     def _set_activity(self, agent_id: str, activity: str) -> None:
         """Update the agent's current_activity for progress visibility."""
@@ -1401,12 +1783,38 @@ class AgentExecutor:
                 if active_node is None or active_node.status != "ACTIVE":
                     raise ValueError("durable plan active node is invalid")
             for node in plan.nodes.values():
+                active_placeholder = (
+                    node.planner_node_id == plan.active_node_id
+                    and node.status == "ACTIVE"
+                    and node.mutation_intent_id is None
+                )
+                if (
+                    plan.tool_binding_required
+                    and not node.tool_name
+                    and not active_placeholder
+                ):
+                    raise ValueError("planner node is missing trusted tool binding")
+                if (
+                    plan.argument_binding_required
+                    and not node.arguments_sha256
+                    and not active_placeholder
+                ):
+                    raise ValueError("planner node is missing argument binding")
+                if (
+                    plan.schema_binding_required
+                    and node.schema_version is None
+                    and not active_placeholder
+                ):
+                    raise ValueError("planner node is missing schema binding")
                 if node.mutation_intent_id is None:
                     continue
                 intent = MutationIntent(
                     plan.execution_id,
                     node.planner_node_id,
                     node.mutation_intent_id,
+                    node.arguments_sha256
+                    if plan.argument_binding_required
+                    else None,
                 )
                 row = self._manager.execution_journal.semantic_intent(
                     agent_id, intent
@@ -1424,6 +1832,7 @@ class AgentExecutor:
                 semantic.get("execution_id", ""),
                 semantic.get("step_id", ""),
                 semantic.get("mutation_intent_id", ""),
+                semantic.get("arguments_sha256"),
             )
             if intent.execution_id != execution_id:
                 raise ValueError("managed semantic execution identity disagrees")
@@ -1453,7 +1862,10 @@ class AgentExecutor:
             ):
                 raise ValueError("managed step identity is incomplete")
             intent = MutationIntent(
-                step["execution_id"], step["step_id"], step["mutation_intent_id"]
+                step["execution_id"],
+                step["step_id"],
+                step["mutation_intent_id"],
+                step.get("arguments_sha256"),
             )
             if execution_id is not None and intent.execution_id != execution_id:
                 raise ValueError("managed step execution identity disagrees")
@@ -2969,6 +3381,15 @@ class AgentExecutor:
             if managed_semantic:
                 try:
                     managed_runtime = agent.get("_managed_runtime") or {}
+                    goal_planning = config.get("goal_planning")
+                    if goal_planning is True or (
+                        isinstance(goal_planning, dict)
+                        and goal_planning.get("enabled") is True
+                    ):
+                        managed_runtime["_auto_advance_plan"] = True
+                    trusted_tool_specs = {
+                        tool.spec.name: tool for tool in tool_instances
+                    }
                     plan_was_missing = "durable_plan" not in (
                         managed_runtime.get("tool_state") or {}
                     )
@@ -2976,6 +3397,11 @@ class AgentExecutor:
                         journal,
                         agent["id"],
                         managed_runtime,
+                        tool_specs=trusted_tool_specs,
+                        authorization_check=self._authorization_check_for(
+                            agent["id"]
+                        ),
+                        strict_schema=True,
                     )
                     if plan_was_missing:
                         managed_controller.persist_into(managed_runtime["tool_state"])

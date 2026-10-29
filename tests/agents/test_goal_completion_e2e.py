@@ -72,6 +72,12 @@ class _VerifiedNotesTool(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-only external note mutation with read-back verification",
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
             effect=ToolEffect.MUTATING,
         )
 
@@ -128,6 +134,15 @@ class _IdentityBoundMutationTool(BaseTool):
         return ToolSpec(
             self.tool_id,
             "test-only identity-bound mutation",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_id": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["target_id"],
+                "additionalProperties": False,
+            },
             effect=ToolEffect.MUTATING,
         )
 
