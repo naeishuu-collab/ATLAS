@@ -148,6 +148,26 @@ def test_uncertain_result_stops_and_is_not_replayed_after_restart(tmp_path):
         reopened.close()
 
 
+def test_crash_after_dispatch_gate_does_not_replay_on_restart(tmp_path):
+    path = tmp_path / "crash.db"
+    journal = ExecutionJournal(path)
+    candidate = Candidate()
+    item = step(1)
+    authorize(journal, [item])
+    claim = journal.reserve_intent(
+        "scope", "computer_use_browser", "1", item.authorization.intent
+    )
+    assert journal.begin_dispatch(claim["token"])
+    journal.close()
+    reopened = ExecutionJournal(path)
+    try:
+        result = execute_authorized_batch(host(candidate), reopened, "scope", [item])
+        assert result[0].state is ExecutionState.UNKNOWN_OUTCOME
+        assert candidate.actions == []
+    finally:
+        reopened.close()
+
+
 def test_cancellation_between_steps_prevents_second_dispatch(tmp_path):
     journal = ExecutionJournal(tmp_path / "journal.db")
     candidate = Candidate()
