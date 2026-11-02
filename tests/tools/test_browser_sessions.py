@@ -63,7 +63,11 @@ def test_real_browser_contexts_are_isolated_and_reused():
             "agent-a",
             "principal-a",
             a,
-            lambda s: s.page.evaluate("localStorage.setItem('secret','agent-a')"),
+            lambda s: s.page.evaluate(
+                "() => { localStorage.setItem('secret','agent-a'); "
+                "sessionStorage.setItem('secret','agent-a'); "
+                "document.cookie='auth=a'; }"
+            ),
         )
         assert (
             manager.run(
@@ -83,9 +87,22 @@ def test_real_browser_contexts_are_isolated_and_reused():
             )
             is None
         )
+        assert manager.run(
+            "agent-b",
+            "principal-b",
+            b,
+            lambda s: s.page.evaluate(
+                "[sessionStorage.getItem('secret'), document.cookie]"
+            ),
+        ) == [None, ""]
         manager.run("agent-a", "principal-a", a, lambda s: s._browser.close())
         with pytest.raises(Exception):
             manager.run("agent-a", "principal-a", a, lambda s: s.page.title())
+        manager.revoke("agent-a", "principal-a", a)
+        old = a
+        a = manager.open("agent-a", "principal-a")
+        assert a != old
+        assert manager.run("agent-a", "principal-a", a, lambda s: s.page.title()) == ""
     finally:
         manager.revoke("agent-a", "principal-a", a)
         manager.revoke("agent-b", "principal-b", b)
