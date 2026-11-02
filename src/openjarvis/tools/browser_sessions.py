@@ -11,7 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from openjarvis.tools.browser import _BrowserSession
+from openjarvis.core.execution import ExecutionState
+from openjarvis.tools.browser import BrowserActionError, _BrowserSession
 
 
 @dataclass
@@ -20,6 +21,7 @@ class _Lease:
     principal: str
     session: _BrowserSession
     expires: float
+    quarantined: bool = False
     lock: threading.RLock = field(default_factory=threading.RLock)
 
 
@@ -77,7 +79,17 @@ class BrowserSessionManager:
                 raise PermissionError("Session revoked")
             if time.monotonic() >= lease.expires:
                 raise PermissionError("Session expired")
-            return lease.session.run(lambda: fn(lease.session))
+            if lease.quarantined:
+                raise PermissionError("Session quarantined after uncertain execution")
+            try:
+                return lease.session.run(lambda: fn(lease.session))
+            except BrowserActionError as exc:
+                if exc.state is ExecutionState.UNKNOWN_OUTCOME:
+                    lease.quarantined = True
+                raise
+            except BaseException:
+                lease.quarantined = True
+                raise
 
     def revoke(self, agent: str, principal: str, session_id: str) -> None:
         lease = self._owned(agent, principal, session_id)

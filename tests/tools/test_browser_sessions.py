@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from openjarvis.tools.browser import BrowserActionError
 from openjarvis.tools.browser_sessions import BrowserSessionManager
 
 
@@ -34,6 +35,25 @@ def test_owner_expiry_revocation_and_recovery():
         replacement = manager.open("agent-a", "principal-a")
         assert replacement != first
         manager.revoke("agent-a", "principal-a", replacement)
+
+
+def test_uncertain_execution_quarantines_but_proven_pre_dispatch_does_not():
+    manager = BrowserSessionManager()
+    sid = manager.open("a", "principal")
+
+    def fail(dispatched):
+        raise BrowserActionError("TIMEOUT", "synthetic", dispatched=dispatched)
+
+    try:
+        with pytest.raises(BrowserActionError):
+            manager.run("a", "principal", sid, lambda _: fail(False))
+        assert manager.run("a", "principal", sid, lambda _: "safe") == "safe"
+        with pytest.raises(BrowserActionError):
+            manager.run("a", "principal", sid, lambda _: fail(True))
+        with pytest.raises(PermissionError, match="quarantined"):
+            manager.run("a", "principal", sid, lambda _: "never")
+    finally:
+        manager.revoke("a", "principal", sid)
 
 
 def test_real_browser_contexts_are_isolated_and_reused():
@@ -97,6 +117,8 @@ def test_real_browser_contexts_are_isolated_and_reused():
         ) == [None, ""]
         manager.run("agent-a", "principal-a", a, lambda s: s._browser.close())
         with pytest.raises(Exception):
+            manager.run("agent-a", "principal-a", a, lambda s: s.page.title())
+        with pytest.raises(PermissionError, match="quarantined"):
             manager.run("agent-a", "principal-a", a, lambda s: s.page.title())
         manager.revoke("agent-a", "principal-a", a)
         old = a
