@@ -17,6 +17,7 @@ from openjarvis.agents.tool_semantics import (
     validate_tool_arguments,
 )
 from openjarvis.core.execution import ToolEffect
+from openjarvis.security.capabilities import Capability
 from openjarvis.tools._stubs import ToolSpec
 from openjarvis.tools.execution_journal import ExecutionJournal
 
@@ -49,6 +50,30 @@ def _spec(
 
 def _valid_arguments() -> dict:
     return {"resource": "asset-report", "mode": "read", "count": 2}
+
+
+def test_enum_capability_is_checked_by_its_canonical_value():
+    seen = []
+
+    def allow(capability, _):
+        seen.append(capability)
+        return True
+
+    validate_tool_arguments(
+        _spec(),
+        _valid_arguments(),
+        required_capabilities=[Capability.NETWORK_FETCH],
+        authorization_scope={"file:read", "network:fetch"},
+        authorization_check=allow,
+    )
+    assert seen == ["file:read", "network:fetch"]
+    with pytest.raises(ToolSemanticError, match="authorization denied"):
+        validate_tool_arguments(
+            _spec(),
+            _valid_arguments(),
+            required_capabilities=[Capability.NETWORK_FETCH],
+            authorization_check=lambda capability, _: capability != "network:fetch",
+        )
 
 
 @pytest.mark.parametrize(

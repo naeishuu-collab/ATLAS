@@ -11,6 +11,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Iterable
 
 TOOL_SCHEMA_VERSION = 1
@@ -561,9 +562,13 @@ def validate_tool_arguments(
     _validate_value(parsed, schema, "$")
 
     capabilities = {
-        str(cap) for cap in (getattr(spec, "required_capabilities", []) or [])
+        str(cap.value if isinstance(cap, Enum) else cap)
+        for cap in (getattr(spec, "required_capabilities", []) or [])
     }
-    capabilities.update(str(cap) for cap in required_capabilities)
+    capabilities.update(
+        str(cap.value if isinstance(cap, Enum) else cap)
+        for cap in required_capabilities
+    )
     if authorization_scope is not None and not capabilities.issubset(
         authorization_scope
     ):
