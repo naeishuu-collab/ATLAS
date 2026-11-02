@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Event
 
 import pytest
 
@@ -308,6 +310,49 @@ def test_verified_action_is_exactly_once_and_nonce_replay_is_denied():
     assert duplicate.failure == "NONCE_REPLAY"
     assert candidate.dispatch_calls == 1
     assert adapter.journal == {"action-1": "COMPLETED"}
+
+
+def test_concurrent_authorization_cannot_dispatch_twice():
+    entered, release = Event(), Event()
+
+    class BlockingCandidate(Candidate):
+        def dispatch(self, authorized):
+            self.dispatch_calls += 1
+            entered.set()
+            assert release.wait(5)
+            return DispatchResult(True)
+
+    candidate = BlockingCandidate()
+    adapter = SafeEngineAdapter(
+        candidate,
+        surface=ControlSurface.WINDOWS_APP,
+        mode=AdapterMode.ENFORCE,
+        session_id="session-1",
+        seal_key=KEY,
+    )
+    action = proposal()
+    auth = authorized(action)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(
+            adapter.execute, action, snapshot(), authorized=auth, verify=lambda *_: True
+        )
+        try:
+            assert entered.wait(5)
+            second = adapter.execute(
+                action, snapshot(), authorized=auth, verify=lambda *_: True
+            )
+            assert second.state is ExecutionState.NOT_STARTED
+            assert second.failure == "ADAPTER_BUSY"
+        finally:
+            release.set()
+        assert first.result(timeout=5).state is ExecutionState.VERIFIED
+    assert candidate.dispatch_calls == 1
+    assert (
+        adapter.execute(
+            action, snapshot(), authorized=auth, verify=lambda *_: True
+        ).failure
+        == "NONCE_REPLAY"
+    )
 
 
 def test_timeout_after_boundary_and_verification_failure_quarantine_without_retry():
