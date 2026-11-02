@@ -92,6 +92,39 @@ class WindowsActionSession:
             raise IdentityError("Stale or unknown observation")
         return self._observation
 
+    def read_value(self, observation_id: str, target_id: str) -> str:
+        """Read a previously observed, verifiable value from the bound receiver."""
+        with self._lock:
+            try:
+                observation = self._current(observation_id)
+                controls = [
+                    item for item in observation["controls"]
+                    if item["target_id"] == target_id
+                ]
+                if (
+                    len(controls) != 1
+                    or controls[0].get("value_verifiable") is not True
+                ):
+                    raise IdentityError("Unsupported or stale value target")
+                identity = controls[0]["identity"]
+                control = self._receiver_state["controls"].get(
+                    identity["automation_id"]
+                )
+                if not control or control["hwnd"] != identity["hwnd"]:
+                    raise IdentityError("Receiver control identity mismatch")
+                if self.receiver.snapshot() != self._receiver_state:
+                    raise IdentityError("Receiver identity changed")
+                value = self.observer.read_value(observation_id, target_id)
+                if not isinstance(value, str) or len(value) > 4096:
+                    raise IdentityError("Invalid bounded control value")
+                if self.receiver.snapshot() != self._receiver_state:
+                    raise IdentityError("Receiver identity changed")
+                return value
+            except Exception:
+                self._observation = None
+                self._receiver_state = None
+                raise
+
     def act(
         self, action: str, observation_id: str, target_id: str, *, value: str = ""
     ) -> dict:
