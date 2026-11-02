@@ -42,20 +42,20 @@ class Candidate:
         return DispatchResult(True)
 
 
-def host(candidate):
+def host(candidate, session_id="session"):
     adapter = SafeEngineAdapter(
         candidate,
         surface=ControlSurface.BROWSER,
         mode=AdapterMode.ENFORCE,
-        session_id="session",
+        session_id=session_id,
         seal_key=KEY,
     )
     schema = [
         BrowserUseActionSpec(
             name,
+            frozenset({"index", "text"}),
             frozenset({"index"}),
-            frozenset({"index"}),
-            {"properties": {"index": {}}, "required": ["index"]},
+            {"properties": {"index": {}, "text": {}}, "required": ["index"]},
             mutation,
             target,
             (),
@@ -63,7 +63,7 @@ def host(candidate):
         )
         for name, (mutation, target) in _POLICIES.items()
     ]
-    return BrowserDispatchFacade(schema, host=adapter, session_id="session")
+    return BrowserDispatchFacade(schema, host=adapter, session_id=session_id)
 
 
 def step(number, verify=lambda *_: True):
