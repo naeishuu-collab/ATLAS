@@ -80,7 +80,7 @@ class _BrowserSession:
         self._browser_thread = None
         self._owner_thread = None
         self._document_id = uuid.uuid4().hex
-        self._observed_targets = []
+        self._observed_targets = {}
         self._runner = _BoundedToolRunner(1, 8, name_prefix="openjarvis-browser")
         atexit.register(self._runner.shutdown)
 
@@ -112,12 +112,12 @@ class _BrowserSession:
     def _invalidate_document(self, *_args) -> None:
         # Conservatively invalidate even on same-URL reloads or iframe changes.
         self._document_id = uuid.uuid4().hex
-        self._observed_targets = []
+        self._observed_targets = {}
 
     def observe_targets(self) -> list[dict[str, Any]]:
         """Capture visible DOM identity, independent of text/selector identity."""
         page = self.page
-        self._observed_targets = []
+        self._observed_targets = {}
         targets = []
         for frame in page.frames:
             handles = frame.locator(
@@ -136,12 +136,27 @@ class _BrowserSession:
                     name: (el.getAttribute('aria-label') || el.innerText ||
                            el.getAttribute('placeholder') || el.id || '').slice(0, 160)
                 })""")
-                self._observed_targets.append(handle)
+                self._observed_targets.setdefault(frame, []).append(handle)
                 targets.append({**description, "frame_url": frame.url})
         return targets
 
     def require_observed_target(self, handle) -> None:
-        for observed in self._observed_targets:
+        try:
+            frame = handle.owner_frame()
+        except Exception as exc:
+            raise BrowserActionError("STALE_TARGET", str(exc)) from exc
+        observed_targets = self._observed_targets.get(frame, [])
+        try:
+            if observed_targets and handle.evaluate(
+                "(element, observed) => { for (let i = 0; i < observed.length; i++) "
+                "if (element === observed[i]) return true; return false; }",
+                observed_targets,
+            ):
+                return
+        except Exception:
+            # A disposed handle must not prevent checking the remaining handles.
+            pass
+        for observed in observed_targets:
             try:
                 if handle.evaluate(
                     "(element, observed) => element === observed", observed

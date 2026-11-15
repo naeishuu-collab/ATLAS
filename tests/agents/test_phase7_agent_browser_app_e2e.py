@@ -98,7 +98,7 @@ def _call(name: str, call_id: str, **arguments) -> dict:
     }
 
 
-def _plan() -> PlanProposal:
+def _plan(document_id: str) -> PlanProposal:
     return PlanProposal(
         proposal_id="phase7-browser-plan",
         steps=(
@@ -106,7 +106,12 @@ def _plan() -> PlanProposal:
                 local_index="mutate",
                 kind="MUTATING",
                 tool_name=BrowserTypeTool.tool_id,
-                arguments={"selector": "#name", "text": "Astra", "clear": True},
+                arguments={
+                    "document_id": document_id,
+                    "selector": "#name",
+                    "text": "Astra",
+                    "clear": True,
+                },
             ),
         ),
     )
@@ -157,7 +162,7 @@ def test_managed_agent_browser_goal_restarts_and_verifies_once(tmp_path, test_br
         planner = type(
             "Planner",
             (),
-            {"propose": lambda _self, _goal, _context=None: _plan()},
+            {"propose": lambda _self, _goal, _context=None: _plan(document_id)},
         )()
         executor = _executor(manager, FakeEngine([]))
         minted = executor.plan_goal(
@@ -240,7 +245,11 @@ def test_managed_agent_browser_stale_target_fails_closed_without_dispatch(
                     local_index="mutate",
                     kind="MUTATING",
                     tool_name=BrowserTypeTool.tool_id,
-                    arguments={"selector": "#name", "text": "blocked"},
+                    arguments={
+                        "document_id": old_document_id,
+                        "selector": "#name",
+                        "text": "blocked",
+                    },
                 ),
             ),
         )

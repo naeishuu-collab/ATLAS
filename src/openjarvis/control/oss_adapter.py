@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -312,6 +313,7 @@ class SafeEngineAdapter:
         self.seal_key = seal_key
         self._journal: dict[str, str] = {}
         self._nonces: set[str] = set()
+        self._dispatch_lock = threading.Lock()
         self._metrics = {
             "observations": 0,
             "proposals": 0,
@@ -358,6 +360,24 @@ class SafeEngineAdapter:
         return AdapterResult(ExecutionState.EXECUTED, proposal=proposal)
 
     def execute(
+        self,
+        proposal: ActionProposal,
+        snapshot: ObservationSnapshot,
+        *,
+        authorized: AuthorizedAction | None,
+        verify: Callable[[ActionProposal, DispatchResult], bool] | None,
+    ) -> AdapterResult:
+        if not self._dispatch_lock.acquire(blocking=False):
+            self._metrics["dispatch_denials"] += 1
+            return AdapterResult(ExecutionState.NOT_STARTED, "ADAPTER_BUSY")
+        try:
+            return self._execute(
+                proposal, snapshot, authorized=authorized, verify=verify
+            )
+        finally:
+            self._dispatch_lock.release()
+
+    def _execute(
         self,
         proposal: ActionProposal,
         snapshot: ObservationSnapshot,

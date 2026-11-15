@@ -360,6 +360,13 @@ class NativeBackend:
         self._owned()
         return bool(self.uia.CompareElements(retained, current))
 
+    def _window_style(self, hwnd: int) -> int:
+        ctypes.set_last_error(0)
+        style = int(self.user.GetWindowLongPtrW(hwnd, -16))
+        if style == 0 and ctypes.get_last_error():
+            raise IdentityError("Cannot verify native control style")
+        return style & 0xFFFFFFFF
+
     def value_capability(self, element: object) -> bool:
         """Prove that a value can be read back before authorizing typing.
 
@@ -372,7 +379,7 @@ class NativeBackend:
             return False
         native_hwnd = int(element.CurrentNativeWindowHandle or 0)
         if native_hwnd:
-            style = int(self.user.GetWindowLongPtrW(native_hwnd, -16)) & 0xFFFFFFFF
+            style = self._window_style(native_hwnd)
             if style & 0x0020:  # ES_PASSWORD; UIA may lag a live style update.
                 return False
         try:
@@ -389,6 +396,11 @@ class NativeBackend:
         self._owned()
         if element.CurrentIsPassword:
             raise IdentityError("Password control verification is unsupported")
+        native_hwnd = int(element.CurrentNativeWindowHandle or 0)
+        if native_hwnd:
+            style = self._window_style(native_hwnd)
+            if style & 0x0020:
+                raise IdentityError("Password control verification is unsupported")
         pattern = element.GetCurrentPattern(10002).QueryInterface(
             self._module.IUIAutomationValuePattern
         )

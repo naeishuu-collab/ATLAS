@@ -217,6 +217,37 @@ def test_same_selector_replacement_is_not_the_observed_dom_target(browser):
     assert browser.run(lambda: browser.page.evaluate("window.clicks")) == 0
 
 
+def test_identity_batch_preserves_frame_and_node_boundaries(browser):
+    from openjarvis.tools.browser import BrowserActionError
+
+    def check():
+        page = browser.page
+        page.set_content(
+            '<button id="first">First</button><button id="second">Second</button>'
+            '<iframe srcdoc="<button id=inside>Inside</button>"></iframe>'
+        )
+        browser.observe_targets()
+        page.evaluate(
+            "() => { window.savedSome = Array.prototype.some; "
+            "Array.prototype.some = () => true; }"
+        )
+        try:
+            page.evaluate(
+                "document.body.insertAdjacentHTML('beforeend', "
+                "'<button id=new>New</button>')"
+            )
+            with pytest.raises(BrowserActionError, match="STALE_TARGET"):
+                browser.require_observed_target(page.locator("#new").element_handle())
+        finally:
+            page.evaluate("() => { Array.prototype.some = window.savedSome; }")
+        browser._observed_targets[page.main_frame][0].dispose()
+        browser.require_observed_target(page.locator("#second").element_handle())
+        frame = page.frames[1]
+        browser.require_observed_target(frame.locator("#inside").element_handle())
+
+    browser.run(check)
+
+
 def test_pinned_handle_never_retargets_after_replacement_at_dispatch(
     browser, monkeypatch
 ):
