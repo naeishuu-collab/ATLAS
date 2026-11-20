@@ -232,6 +232,8 @@ def test_explicit_termination_failure_remains_visible():
 
 def test_worker_force_stop_cleans_up_after_termination_failure():
     class Process:
+        returncode = None
+
         def poll(self):
             return 0
 
@@ -408,3 +410,81 @@ def test_wait_failure_precedes_later_close_failure():
         with pytest.raises(TimeoutError, match="WAIT_FIRST"):
             worker.close()
     assert not worker.closed
+
+
+def test_worker_stop_wait_failure_still_closes_job_and_timer():
+    import subprocess
+
+    class Process:
+        pid = 123
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("fixture", timeout)
+
+    class Job:
+        limits = {}
+        active = 1
+        closed = False
+
+        def active_processes(self):
+            return self.active
+
+        def terminate(self):
+            self.active = 0
+
+        def close(self):
+            self.closed = True
+
+    process = Process()
+    job = Job()
+    sandbox = SandboxedProcess(
+        process,
+        job,
+        SandboxPolicy("fixture", "stop-wait", "python", max_runtime=30),
+        True,
+    )
+    worker = WorkerProcess(
+        ["python"], worker_kind="fixture", session_id="stop-wait", env={}
+    )
+    worker._process = process
+    worker._sandbox_process = sandbox
+    with pytest.raises(subprocess.TimeoutExpired):
+        worker.stop(force=True)
+    assert job.closed and sandbox.closed
+    assert not sandbox._timer.is_alive() and not worker.lifecycle.cleaned
+
+
+def test_worker_stop_poll_failure_still_closes_sandbox():
+    class Process:
+        returncode = 0
+
+        def wait(self, timeout):
+            return 0
+
+        def poll(self):
+            raise OSError("POLL_FAILED")
+
+    class Sandbox:
+        closed = False
+
+        def terminate(self):
+            pass
+
+        def close(self):
+            self.closed = True
+            return {"closed": True}
+
+    process = Process()
+    sandbox = Sandbox()
+    worker = WorkerProcess(
+        ["python"], worker_kind="fixture", session_id="stop-poll", env={}
+    )
+    worker._process = process
+    worker._sandbox_process = sandbox
+    with pytest.raises(OSError, match="POLL_FAILED"):
+        worker.stop(force=True)
+    assert sandbox.closed and not worker.lifecycle.cleaned
