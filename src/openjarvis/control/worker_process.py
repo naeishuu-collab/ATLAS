@@ -325,14 +325,26 @@ class WorkerProcess:
         )[-4096:]
         self.lifecycle.cleaned = process.poll() is not None
         if self._sandbox_process is not None:
-            self.lifecycle.sandbox = self._sandbox_process.close()
+            try:
+                self.lifecycle.sandbox = self._sandbox_process.close()
+            except Exception:
+                self.lifecycle.cleaned = False
+                raise
         return self.lifecycle
 
     def _kill_process_tree(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
         if self._sandbox_process is not None:
-            self._sandbox_process.terminate()
+            try:
+                self._sandbox_process.terminate()
+            except Exception as exc:
+                self.lifecycle.cleaned = False
+                try:
+                    self._sandbox_process.close()
+                except Exception as cleanup_exc:
+                    raise exc from cleanup_exc
+                raise
+            return
+        if process.poll() is not None:
             return
         if os.name == "nt":
             subprocess.run(
