@@ -346,6 +346,11 @@ class WorkerProcess:
                 self.lifecycle.sandbox = self._sandbox_process.close()
             except BaseException as exc:
                 self.lifecycle.cleaned = False
+                try:
+                    self.lifecycle.sandbox = self._sandbox_process.evidence()
+                except BaseException as evidence_error:
+                    if exc.__cause__ is None:
+                        exc.__cause__ = evidence_error
                 if failure is None:
                     failure = exc
                 else:
