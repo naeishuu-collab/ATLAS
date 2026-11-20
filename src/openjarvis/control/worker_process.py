@@ -300,39 +300,76 @@ class WorkerProcess:
         if process is None:
             self.lifecycle.cleaned = True
             return self.lifecycle
-        if force:
-            self.lifecycle.forced_termination = True
-            self._kill_process_tree(process)
-        else:
-            try:
-                if process.stdin is not None:
-                    process.stdin.close()
-            except OSError:
-                pass
+        failure: BaseException | None = None
+        cleanup_failure: BaseException | None = None
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self.lifecycle.forced_termination = True
-            self._kill_process_tree(process)
-            process.wait(timeout=timeout)
+            if force:
+                self.lifecycle.forced_termination = True
+                self._kill_process_tree(process)
+            else:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.lifecycle.forced_termination = True
+                self._kill_process_tree(process)
+                process.wait(timeout=timeout)
+        except BaseException as exc:
+            failure = exc
         if self._stderr_thread is not None:
-            self._stderr_thread.join(timeout=0.2)
+            try:
+                self._stderr_thread.join(timeout=0.2)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
         if self._stdout_thread is not None:
-            self._stdout_thread.join(timeout=0.2)
-        self.lifecycle.exit_code = process.returncode
-        self.lifecycle.stderr = b"".join(self._stderr_chunks).decode(
-            "utf-8", errors="replace"
-        )[-4096:]
-        self.lifecycle.cleaned = process.poll() is not None
+            try:
+                self._stdout_thread.join(timeout=0.2)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        try:
+            self.lifecycle.exit_code = process.returncode
+            self.lifecycle.stderr = b"".join(self._stderr_chunks).decode(
+                "utf-8", errors="replace"
+            )[-4096:]
+            self.lifecycle.cleaned = process.poll() is not None
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
         if self._sandbox_process is not None:
-            self.lifecycle.sandbox = self._sandbox_process.close()
+            try:
+                self.lifecycle.sandbox = self._sandbox_process.close()
+            except BaseException as exc:
+                self.lifecycle.cleaned = False
+                if failure is None:
+                    failure = exc
+                else:
+                    cleanup_failure = exc
+        if failure is not None:
+            self.lifecycle.cleaned = False
+            if cleanup_failure is not None:
+                raise failure from cleanup_failure
+            raise failure
         return self.lifecycle
 
     def _kill_process_tree(self, process: subprocess.Popen[bytes]) -> None:
-        if process.poll() is not None:
-            return
         if self._sandbox_process is not None:
-            self._sandbox_process.terminate()
+            try:
+                self._sandbox_process.terminate()
+            except Exception as exc:
+                self.lifecycle.cleaned = False
+                try:
+                    self._sandbox_process.close()
+                except Exception as cleanup_exc:
+                    raise exc from cleanup_exc
+                raise
+            return
+        if process.poll() is not None:
             return
         if os.name == "nt":
             subprocess.run(

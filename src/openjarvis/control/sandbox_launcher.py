@@ -85,6 +85,20 @@ class _ExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+class _BasicAccountingInformation(ctypes.Structure):
+    _fields_ = [
+        ("total_user_time", ctypes.c_int64),
+        ("total_kernel_time", ctypes.c_int64),
+        ("period_user_time", ctypes.c_int64),
+        ("period_kernel_time", ctypes.c_int64),
+        ("page_fault_count", wintypes.DWORD),
+        ("total_processes", wintypes.DWORD),
+        ("active_processes", wintypes.DWORD),
+        ("terminated_processes", wintypes.DWORD),
+    ]
+
+
+JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
@@ -105,6 +119,14 @@ def _windows_kernel32():
         wintypes.DWORD,
     ]
     kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+    ]
+    kernel.QueryInformationJobObject.restype = wintypes.BOOL
     kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     kernel.AssignProcessToJobObject.restype = wintypes.BOOL
     kernel.IsProcessInJob.argtypes = [
@@ -178,6 +200,20 @@ class _JobObject:
                 "SANDBOX_JOB_TERMINATE_FAILED", str(ctypes.get_last_error())
             )
 
+    def active_processes(self) -> int:
+        accounting = _BasicAccountingInformation()
+        if not self.handle or not self.kernel.QueryInformationJobObject(
+            self.handle,
+            JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+            ctypes.byref(accounting),
+            ctypes.sizeof(accounting),
+            None,
+        ):
+            raise SandboxLaunchError(
+                "SANDBOX_JOB_QUERY_FAILED", str(ctypes.get_last_error())
+            )
+        return int(accounting.active_processes)
+
     def close(self) -> None:
         if self.handle:
             self.kernel.CloseHandle(self.handle)
@@ -201,23 +237,47 @@ class SandboxedProcess:
         self.timed_out = False
         self.forced_termination = False
         self.closed = False
+        self._termination_error: SandboxLaunchError | None = None
+        self._first_error: Exception | None = None
+        self._job_lock = threading.RLock()
         self._timer = threading.Timer(policy.max_runtime, self._deadline)
         self._timer.daemon = True
         self._timer.start()
 
     def _deadline(self) -> None:
-        if self.process.poll() is None:
-            self.timed_out = True
+        try:
+            self._terminate_job(deadline=True)
+        except Exception as exc:
+            if self._first_error is None:
+                self._first_error = exc
+
+    def terminate(self) -> None:
+        self._terminate_job(deadline=False)
+
+    def _terminate_job(self, *, deadline: bool) -> None:
+        with self._job_lock:
+            if self.closed:
+                return
+            try:
+                if not self.job.active_processes():
+                    return
+            except SandboxLaunchError:
+                # A failed query provides no proof that the job is empty.
+                pass
+            if deadline:
+                self.timed_out = True
             self.forced_termination = True
             try:
                 self.job.terminate()
-            except SandboxLaunchError:
-                pass
-
-    def terminate(self) -> None:
-        if self.process.poll() is None:
-            self.forced_termination = True
-            self.job.terminate()
+            except SandboxLaunchError as exc:
+                if self._termination_error is None:
+                    self._termination_error = exc
+                if self._first_error is None:
+                    self._first_error = SandboxLaunchError(
+                        "SANDBOX_TERMINATE_FAILED", str(exc)
+                    )
+                self.job.close()
+                raise
 
     def evidence(self) -> dict[str, Any]:
         return {
@@ -236,15 +296,30 @@ class SandboxedProcess:
         }
 
     def close(self) -> dict[str, Any]:
-        if self.closed:
-            return self.evidence()
         self._timer.cancel()
-        if self.process.poll() is None:
-            self.terminate()
-            self.process.wait(timeout=2.0)
-        self.job.close()
-        self.closed = True
-        return self.evidence()
+        self._timer.join()
+        with self._job_lock:
+            if not self.closed:
+                try:
+                    self.terminate()
+                except Exception as exc:
+                    if self._first_error is None:
+                        self._first_error = exc
+                try:
+                    self.process.wait(timeout=2.0)
+                except Exception as exc:
+                    if self._first_error is None:
+                        self._first_error = exc
+                try:
+                    self.job.close()
+                except Exception as exc:
+                    if self._first_error is None:
+                        self._first_error = exc
+                else:
+                    self.closed = True
+            if self._first_error is not None:
+                raise self._first_error from self._termination_error
+            return self.evidence()
 
 
 class SandboxLauncher:

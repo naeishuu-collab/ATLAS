@@ -8,8 +8,20 @@ use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
+const DESKTOP_UV_SYNC_ARGS: &[&str] = &[
+    "sync",
+    "--locked",
+    "--extra",
+    "desktop",
+    "--extra",
+    "inference-cloud",
+    "--extra",
+    "inference-google",
+    "--group",
+    "desktop-native",
+];
 const DESKTOP_UV_SYNC_COMMAND: &str =
-    "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
+    "uv sync --locked --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
 
 /// Small, fast model used when startup needs a default Ollama tag.
 const STARTUP_MODEL: &str = "qwen3.5:4b";
@@ -1480,20 +1492,10 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.detail = "Installing dependencies (uv sync — may take 1-2 min on first boot)...".into();
     }
     let mut sync_cmd = tokio::process::Command::new(&uv_bin);
+    // openjarvis_rust lives in a uv dependency group (not the published
+    // `desktop` extra) so pip installs from PyPI don't require it (#584).
     sync_cmd
-        .args([
-            "sync",
-            "--extra",
-            "desktop",
-            "--extra",
-            "inference-cloud",
-            "--extra",
-            "inference-google",
-            // openjarvis_rust lives in a uv dependency group (not the published
-            // `desktop` extra) so pip installs from PyPI don't require it (#584).
-            "--group",
-            "desktop-native",
-        ])
+        .args(DESKTOP_UV_SYNC_ARGS)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .current_dir(root);
@@ -3457,7 +3459,7 @@ mod tests {
         should_persist_resolved_model, spawn_owned_child, stage_pending_inference_config_at,
         startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, BackendManager,
         InferenceConfig, InferenceCredentialStore, PendingInferenceRollback, SetupStatus,
-        SourceKind, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
+        SourceKind, DESKTOP_UV_SYNC_ARGS, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -3573,6 +3575,13 @@ mod tests {
         let tail = uv_sync_stderr_tail(&s, 100);
         assert_eq!(tail.chars().count(), 100);
         assert!(tail.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn desktop_uv_sync_command_matches_locked_args() {
+        let rendered = format!("uv {}", DESKTOP_UV_SYNC_ARGS.join(" "));
+        assert_eq!(DESKTOP_UV_SYNC_COMMAND, rendered);
+        assert!(DESKTOP_UV_SYNC_ARGS.contains(&"--locked"));
     }
 
     #[test]
