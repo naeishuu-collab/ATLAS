@@ -11,6 +11,7 @@ import ctypes
 import os
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from ctypes import wintypes
@@ -104,6 +105,25 @@ JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x00000008
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
+CREATE_SUSPENDED = 0x00000004
+TH32CS_SNAPTHREAD = 0x00000004
+THREAD_SUSPEND_RESUME = 0x0002
+THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+WAIT_OBJECT_0 = 0x00000000
+WAIT_TIMEOUT = 0x00000102
+ERROR_NO_MORE_FILES = 18
+
+
+class _ThreadEntry32(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ThreadID", wintypes.DWORD),
+        ("th32OwnerProcessID", wintypes.DWORD),
+        ("tpBasePri", ctypes.c_long),
+        ("tpDeltaPri", ctypes.c_long),
+        ("dwFlags", wintypes.DWORD),
+    ]
 
 
 def _windows_kernel32():
@@ -139,7 +159,142 @@ def _windows_kernel32():
     kernel.TerminateJobObject.restype = wintypes.BOOL
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessId.restype = wintypes.DWORD
+    kernel.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+    kernel.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel.Thread32First.restype = wintypes.BOOL
+    kernel.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+    kernel.Thread32Next.restype = wintypes.BOOL
+    kernel.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenThread.restype = wintypes.HANDLE
+    kernel.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel.ResumeThread.restype = wintypes.DWORD
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
     return kernel
+
+
+def _close_windows_handle(kernel, handle, failure: str) -> None:
+    if handle and not kernel.CloseHandle(handle):
+        raise SandboxLaunchError(failure, str(ctypes.get_last_error()))
+
+
+def _require_process_live(kernel, process_handle) -> None:
+    state = kernel.WaitForSingleObject(process_handle, 0)
+    if state == WAIT_TIMEOUT:
+        return
+    if state == WAIT_OBJECT_0:
+        raise SandboxLaunchError("SANDBOX_PROCESS_EXITED_BEFORE_RESUME")
+    raise SandboxLaunchError(
+        "SANDBOX_PROCESS_STATE_QUERY_FAILED", str(ctypes.get_last_error())
+    )
+
+
+def _resume_primary_thread(process: subprocess.Popen[bytes]) -> None:
+    """Resume the sole thread of a still-live, suspended, job-assigned process."""
+
+    kernel = _windows_kernel32()
+    process_handle = process._handle
+    handle_pid = kernel.GetProcessId(process_handle)
+    if not handle_pid or handle_pid != process.pid:
+        raise SandboxLaunchError(
+            "SANDBOX_PROCESS_HANDLE_INVALID", str(ctypes.get_last_error())
+        )
+    _require_process_live(kernel, process_handle)
+
+    snapshot = kernel.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    invalid = ctypes.c_void_p(-1).value
+    if not snapshot or snapshot == invalid:
+        raise SandboxLaunchError(
+            "SANDBOX_THREAD_SNAPSHOT_FAILED", str(ctypes.get_last_error())
+        )
+
+    thread_handle = None
+    primary_error: BaseException | None = None
+    try:
+        # The live Popen handle pins this process identity while its PID is used.
+        entry = _ThreadEntry32()
+        entry.dwSize = ctypes.sizeof(entry)
+        found = kernel.Thread32First(snapshot, ctypes.byref(entry))
+        if not found and ctypes.get_last_error() != ERROR_NO_MORE_FILES:
+            raise SandboxLaunchError(
+                "SANDBOX_THREAD_ENUMERATION_FAILED", str(ctypes.get_last_error())
+            )
+        thread_id = None
+        while found:
+            if entry.th32OwnerProcessID == handle_pid:
+                if thread_id is not None:
+                    raise SandboxLaunchError("SANDBOX_PRIMARY_THREAD_AMBIGUOUS")
+                thread_id = entry.th32ThreadID
+            entry.dwSize = ctypes.sizeof(entry)
+            found = kernel.Thread32Next(snapshot, ctypes.byref(entry))
+            if not found and ctypes.get_last_error() != ERROR_NO_MORE_FILES:
+                raise SandboxLaunchError(
+                    "SANDBOX_THREAD_ENUMERATION_FAILED", str(ctypes.get_last_error())
+                )
+        if thread_id is None:
+            raise SandboxLaunchError("SANDBOX_PRIMARY_THREAD_NOT_FOUND")
+
+        thread_handle = kernel.OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            False,
+            thread_id,
+        )
+        if not thread_handle:
+            raise SandboxLaunchError(
+                "SANDBOX_PRIMARY_THREAD_OPEN_FAILED", str(ctypes.get_last_error())
+            )
+        thread_pid = kernel.GetProcessIdOfThread(thread_handle)
+        if not thread_pid:
+            raise SandboxLaunchError(
+                "SANDBOX_PRIMARY_THREAD_OWNER_QUERY_FAILED",
+                str(ctypes.get_last_error()),
+            )
+        if thread_pid != handle_pid:
+            raise SandboxLaunchError("SANDBOX_PRIMARY_THREAD_OWNER_MISMATCH")
+        _require_process_live(kernel, process_handle)
+
+        previous_suspend_count = kernel.ResumeThread(thread_handle)
+        if previous_suspend_count == 0xFFFFFFFF:
+            raise SandboxLaunchError(
+                "SANDBOX_THREAD_RESUME_FAILED", str(ctypes.get_last_error())
+            )
+        if previous_suspend_count != 1:
+            raise SandboxLaunchError(
+                "SANDBOX_THREAD_SUSPEND_COUNT_INVALID",
+                str(previous_suspend_count),
+            )
+    except BaseException as exc:
+        primary_error = exc
+
+    close_errors = []
+    for handle, reason in (
+        (thread_handle, "SANDBOX_PRIMARY_THREAD_CLOSE_FAILED"),
+        (snapshot, "SANDBOX_THREAD_SNAPSHOT_CLOSE_FAILED"),
+    ):
+        try:
+            _close_windows_handle(kernel, handle, reason)
+        except BaseException as exc:
+            close_errors.append(exc)
+
+    if primary_error is not None:
+        if close_errors:
+            detail = "; ".join(str(error) for error in close_errors)
+            raise primary_error from SandboxLaunchError(
+                "SANDBOX_THREAD_HANDLE_CLOSE_FAILED", detail
+            )
+        raise primary_error
+    if close_errors:
+        if len(close_errors) == 1:
+            raise close_errors[0]
+        raise SandboxLaunchError(
+            "SANDBOX_THREAD_HANDLE_CLOSE_FAILED",
+            "; ".join(str(error) for error in close_errors),
+        )
 
 
 class _JobObject:
@@ -171,8 +326,11 @@ class _JobObject:
                 "limit_flags": int(limits.basic.limit_flags),
                 "active_process_limit": int(limits.basic.active_process_limit),
             }
-        except BaseException:
-            self.close()
+        except BaseException as exc:
+            try:
+                self.close()
+            except BaseException as close_error:
+                raise exc from close_error
             raise
 
     def assign(self, process: subprocess.Popen[bytes]) -> None:
@@ -216,7 +374,8 @@ class _JobObject:
 
     def close(self) -> None:
         if self.handle:
-            self.kernel.CloseHandle(self.handle)
+            handle = self.handle
+            _close_windows_handle(self.kernel, handle, "SANDBOX_JOB_CLOSE_FAILED")
             self.handle = None
 
 
@@ -229,14 +388,20 @@ class SandboxedProcess:
         job: _JobObject,
         policy: SandboxPolicy,
         process_in_job: bool,
+        pre_start_containment: bool = False,
     ) -> None:
         self.process = process
         self.job = job
         self.policy = policy
         self.process_in_job = process_in_job
+        self.pre_start_containment = pre_start_containment
         self.timed_out = False
         self.forced_termination = False
         self.closed = False
+        self.job_exit_confirmed = False
+        self.process_wait_confirmed = False
+        self.exit_observed_at: float | None = None
+        self.observed_exit_code: int | None = None
         self._termination_error: SandboxLaunchError | None = None
         self._first_error: Exception | None = None
         self._job_lock = threading.RLock()
@@ -276,7 +441,10 @@ class SandboxedProcess:
                     self._first_error = SandboxLaunchError(
                         "SANDBOX_TERMINATE_FAILED", str(exc)
                     )
-                self.job.close()
+                try:
+                    self.job.close()
+                except Exception as close_error:
+                    raise exc from close_error
                 raise
 
     def evidence(self) -> dict[str, Any]:
@@ -287,12 +455,17 @@ class SandboxedProcess:
             "job_object": True,
             "process_in_job": self.process_in_job,
             "job_limits": dict(self.job.limits),
-            "assignment_after_process_start": True,
+            "assignment_after_process_start": not self.pre_start_containment,
+            "pre_start_containment": self.pre_start_containment,
             "max_runtime": self.policy.max_runtime,
             "close_fds_requested": True,
             "timed_out": self.timed_out,
             "forced_termination": self.forced_termination,
             "closed": self.closed,
+            "job_exit_confirmed": self.job_exit_confirmed,
+            "process_wait_confirmed": self.process_wait_confirmed,
+            "exit_observed_at": self.exit_observed_at,
+            "observed_exit_code": self.observed_exit_code,
         }
 
     def close(self) -> dict[str, Any]:
@@ -300,16 +473,69 @@ class SandboxedProcess:
         self._timer.join()
         with self._job_lock:
             if not self.closed:
+                poll = getattr(self.process, "poll", None)
                 try:
-                    self.terminate()
+                    process_running = not callable(poll) or poll() is None
+                except Exception as exc:
+                    process_running = True
+                    if self._first_error is None:
+                        self._first_error = exc
+                if process_running:
+                    try:
+                        self.terminate()
+                    except Exception as exc:
+                        if self._first_error is None:
+                            self._first_error = exc
+                else:
+                    # Let Job accounting catch up with an already-exited process
+                    # before deciding that a descendant needs forced termination.
+                    deadline = time.monotonic() + 0.1
+                    active = 1
+                    while active:
+                        try:
+                            active = self.job.active_processes()
+                        except Exception as exc:
+                            active = 1
+                            if self._first_error is None:
+                                self._first_error = exc
+                            break
+                        if not active or time.monotonic() >= deadline:
+                            break
+                        threading.Event().wait(0.01)
+                    if active:
+                        try:
+                            self.terminate()
+                        except Exception as exc:
+                            if self._first_error is None:
+                                self._first_error = exc
+                try:
+                    self.observed_exit_code = self.process.wait(timeout=2.0)
+                    self.process_wait_confirmed = True
+                    self.exit_observed_at = time.time()
                 except Exception as exc:
                     if self._first_error is None:
                         self._first_error = exc
-                try:
-                    self.process.wait(timeout=2.0)
-                except Exception as exc:
-                    if self._first_error is None:
-                        self._first_error = exc
+                if self.process_wait_confirmed:
+                    deadline = time.monotonic() + 2.0
+                    while True:
+                        try:
+                            active = self.job.active_processes()
+                        except Exception as exc:
+                            if self._first_error is None:
+                                self._first_error = exc
+                            break
+                        if not active:
+                            self.job_exit_confirmed = (
+                                self.pre_start_containment and self.process_in_job
+                            )
+                            break
+                        if time.monotonic() >= deadline:
+                            if self._first_error is None:
+                                self._first_error = SandboxLaunchError(
+                                    "SANDBOX_JOB_EXIT_UNCONFIRMED"
+                                )
+                            break
+                        threading.Event().wait(0.01)
                 try:
                     self.job.close()
                 except Exception as exc:
@@ -346,8 +572,9 @@ class SandboxLauncher:
         process: subprocess.Popen[bytes] | None = None
         job: _JobObject | None = None
         try:
+            job = _JobObject(self.policy)
             creationflags = (
-                CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED
             )
             process = subprocess.Popen(
                 list(command),
@@ -360,42 +587,72 @@ class SandboxLauncher:
                 close_fds=True,
                 creationflags=creationflags,
             )
-            job = _JobObject(self.policy)
-            # shortcut: post-start assignment; native CreateProcess is next upgrade.
             job.assign(process)
             in_job = job.contains(process)
             if not in_job:
                 raise SandboxLaunchError("SANDBOX_JOB_MEMBERSHIP_NOT_PROVEN")
-            return SandboxedProcess(process, job, self.policy, in_job)
-        except SandboxLaunchError:
-            if job is not None:
-                try:
-                    job.terminate()
-                except SandboxLaunchError:
-                    pass
-            if process is not None:
-                try:
-                    process.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2.0)
-            if job is not None:
-                job.close()
+            _resume_primary_thread(process)
+            return SandboxedProcess(process, job, self.policy, in_job, True)
+        except SandboxLaunchError as exc:
+            cleanup_error = _cleanup_failed_launch(process, job)
+            if cleanup_error is not None:
+                raise exc from cleanup_error
             raise
         except (OSError, ValueError) as exc:
-            if job is not None:
-                try:
-                    job.terminate()
-                except SandboxLaunchError:
-                    pass
-                job.close()
-            if process is not None:
-                try:
-                    process.kill()
-                    process.wait(timeout=2.0)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-            raise SandboxLaunchError("SANDBOX_LAUNCH_FAILED", str(exc)) from exc
+            cleanup_error = _cleanup_failed_launch(process, job)
+            detail = str(exc)
+            if cleanup_error is not None:
+                detail = f"{detail}; {cleanup_error}"
+            raise SandboxLaunchError("SANDBOX_LAUNCH_FAILED", detail) from exc
+        except BaseException as exc:
+            cleanup_error = _cleanup_failed_launch(process, job)
+            if cleanup_error is not None:
+                raise exc from cleanup_error
+            raise
+
+
+def _cleanup_failed_launch(
+    process: subprocess.Popen[bytes] | None,
+    job: _JobObject | None,
+) -> SandboxLaunchError | None:
+    errors = []
+    if job is not None:
+        try:
+            job.terminate()
+        except Exception as exc:
+            errors.append(exc)
+    if process is not None:
+        try:
+            running = process.poll() is None
+        except Exception as exc:
+            running = True
+            errors.append(exc)
+        if running:
+            try:
+                process.kill()
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=2.0)
+            except Exception as exc:
+                errors.append(exc)
+        except Exception as exc:
+            errors.append(exc)
+    if job is not None:
+        try:
+            job.close()
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        return SandboxLaunchError(
+            "SANDBOX_LAUNCH_CLEANUP_FAILED",
+            "; ".join(str(error) for error in errors),
+        )
+    return None
 
 
 def _normalized(value: str) -> str:

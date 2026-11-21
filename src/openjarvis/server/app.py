@@ -113,9 +113,7 @@ def _restore_sendblue_bindings(app: FastAPI) -> None:
                         bus=bus,
                         agent_manager=mgr,
                         deep_research_agent=dr_agent,
-                        capability_policy=getattr(
-                            app.state, "capability_policy", None
-                        ),
+                        capability_policy=getattr(app.state, "capability_policy", None),
                         agent_id="server:channel_bridge",
                     )
 
@@ -177,6 +175,11 @@ def create_app(
     rate_limiter=None,
     audit_logger=None,
     host_supply: Any = None,
+    host_principal_authority: Any = None,
+    host_principal_context: Any = None,
+    task_checkpoint_integrity_key: bytes | None = None,
+    task_worker_supervisor_factory: Any = None,
+    host_supervisor_observer: Any = None,
     api_key: str = "",
     webhook_config: dict | None = None,
     cors_origins: list[str] | None = None,
@@ -309,6 +312,46 @@ def create_app(
     app.state.audit_logger = audit_logger
     # Host-issued cloud supply authority (default None = default-deny legacy).
     app.state.host_supply = host_supply
+    app.state.host_principal_authority = host_principal_authority
+    app.state.task_checkpoint_integrity_key = task_checkpoint_integrity_key
+    app.state.task_worker_supervisor_factory = task_worker_supervisor_factory
+    app.state.host_supervisor_observer = host_supervisor_observer
+    app.state.testing = False
+    if any(
+        value is not None
+        for value in (
+            host_principal_authority,
+            host_principal_context,
+            task_checkpoint_integrity_key,
+            task_worker_supervisor_factory,
+        )
+    ):
+        principal = getattr(host_principal_context, "principal", None)
+        if (
+            not callable(getattr(host_principal_authority, "accepts", None))
+            or not host_principal_authority.accepts(principal)
+            or not isinstance(task_checkpoint_integrity_key, bytes)
+            or len(task_checkpoint_integrity_key) < 32
+            or not callable(task_worker_supervisor_factory)
+            or not isinstance(getattr(host_principal_context, "session_id", None), str)
+            or not host_principal_context.session_id
+        ):
+            raise ValueError("Windows Host bootstrap dependencies are incomplete")
+
+        @app.middleware("http")
+        async def inject_host_principal_context(request, call_next):
+            try:
+                valid = (
+                    host_principal_authority.accepts(principal)
+                    and host_principal_authority.session_id(principal)
+                    == host_principal_context.session_id
+                )
+            except Exception:
+                valid = False
+            if valid:
+                request.state.host_principal_context = host_principal_context
+            return await call_next(request)
+
     app.state.mcp_tools = list(mcp_tools or [])
     app.state._mcp_discovery_lock = threading.Lock()
     app.state._mcp_clients_lock = threading.Lock()
@@ -390,9 +433,7 @@ def create_app(
                 for agent in manager.list_agents():
                     if agent.get("status") == "running":
                         try:
-                            manager.request_cancellation(
-                                agent["id"], reason="shutdown"
-                            )
+                            manager.request_cancellation(agent["id"], reason="shutdown")
                         except ValueError:
                             pass
             except Exception:
