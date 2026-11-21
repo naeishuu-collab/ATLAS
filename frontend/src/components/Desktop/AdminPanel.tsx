@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import type React from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { SetupStatus } from '../../lib/api';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -272,11 +273,19 @@ export function AdminPanel({ apiUrl }: { apiUrl: string }) {
     setCommandRunning(true);
     setCommandOutput(null);
     try {
-      const output = await invoke<string>('run_jarvis_command', {
-        args: ['serve', '--port', '8000'],
-      });
-      setCommandOutput(output);
-      // Wait a moment then refresh health
+      const previous = await invoke<SetupStatus>('get_setup_status');
+      if (previous.phase === 'stop_unconfirmed') {
+        setCommandOutput(
+          `Shutdown unconfirmed: ${previous.error ?? 'Backend status is unknown.'}`,
+        );
+        return;
+      }
+      if (previous.server_ready) {
+        setCommandOutput('Managed backend is already ready.');
+        return;
+      }
+      await invoke<void>('start_backend');
+      setCommandOutput('Managed backend startup requested. Health status will refresh.');
       setTimeout(refresh, 2000);
     } catch (err) {
       setCommandOutput(err instanceof Error ? err.message : String(err));
@@ -289,13 +298,18 @@ export function AdminPanel({ apiUrl }: { apiUrl: string }) {
     setCommandRunning(true);
     setCommandOutput(null);
     try {
-      const output = await invoke<string>('run_jarvis_command', {
-        args: ['stop'],
-      });
-      setCommandOutput(output);
+      await invoke<void>('stop_backend');
+      setCommandOutput('Managed backend child processes stopped.');
       setTimeout(refresh, 2000);
     } catch (err) {
-      setCommandOutput(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      const status = await invoke<SetupStatus>('get_setup_status').catch(() => null);
+      setCommandOutput(
+        status?.phase === 'stop_unconfirmed'
+          ? `Shutdown unconfirmed: ${status.error ?? message}`
+          : message,
+      );
+      setTimeout(refresh, 2000);
     } finally {
       setCommandRunning(false);
     }

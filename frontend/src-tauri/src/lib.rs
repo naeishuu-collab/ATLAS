@@ -392,11 +392,38 @@ fn project_root_near_executable(exe: &std::path::Path) -> Option<std::path::Path
 
 struct ChildHandle {
     child: tokio::process::Child,
+    #[cfg(test)]
+    fail_kill: bool,
 }
 
 impl ChildHandle {
-    async fn kill(&mut self) {
-        let _ = self.child.kill().await;
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            child,
+            #[cfg(test)]
+            fail_kill: false,
+        }
+    }
+
+    async fn kill(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.fail_kill {
+            return Err("injected child stop failure".into());
+        }
+
+        let pid = self.child.id();
+        match self.child.kill().await {
+            Ok(()) => Ok(()),
+            Err(kill_error) => match self.child.try_wait() {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => Err(format!(
+                    "Process {pid:?} may still be running: {kill_error}"
+                )),
+                Err(wait_error) => Err(format!(
+                    "Could not confirm process {pid:?} stop: {kill_error}; status check failed: {wait_error}"
+                )),
+            },
+        }
     }
 }
 
@@ -426,6 +453,7 @@ struct BackendManager {
     jarvis: Option<ChildHandle>,
     jarvis_stderr_tail: StderrTail,
     boot_task: Option<tauri::async_runtime::JoinHandle<()>>,
+    untracked_child_unconfirmed: bool,
 }
 
 impl Default for BackendManager {
@@ -435,43 +463,113 @@ impl Default for BackendManager {
             jarvis: None,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
             boot_task: None,
+            untracked_child_unconfirmed: false,
         }
     }
 }
 
 impl BackendManager {
-    async fn stop_all(&mut self) {
+    async fn stop_all(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if self.untracked_child_unconfirmed {
+            errors.push("A startup child lost its owner; shutdown remains unconfirmed".into());
+        }
         if let Some(task) = self.boot_task.take() {
             task.abort();
-            // `abort()` only requests cancellation.  Await it before touching
-            // children or returning so the boot future has dropped any local,
-            // not-yet-registered child and cannot write config after reset.
-            let _ = task.await;
+            if let Err(error) = task.await {
+                // Dropping a boot task kills local children but cannot confirm they exited.
+                self.untracked_child_unconfirmed = true;
+                errors.push(format!(
+                    "Startup task ended; an unregistered child may still be running: {error}"
+                ));
+            }
         }
-        if let Some(ref mut h) = self.jarvis {
-            h.kill().await;
+
+        let jarvis_result = if let Some(handle) = self.jarvis.as_mut() {
+            Some(handle.kill().await)
+        } else {
+            None
+        };
+        match jarvis_result {
+            Some(Ok(())) => self.jarvis = None,
+            Some(Err(error)) => errors.push(format!("Could not stop Jarvis child: {error}")),
+            None => {}
         }
-        self.jarvis = None;
-        if let Some(ref mut h) = self.ollama {
-            h.kill().await;
+
+        let ollama_result = if let Some(handle) = self.ollama.as_mut() {
+            Some(handle.kill().await)
+        } else {
+            None
+        };
+        match ollama_result {
+            Some(Ok(())) => self.ollama = None,
+            Some(Err(error)) => errors.push(format!("Could not stop Ollama child: {error}")),
+            None => {}
         }
-        self.ollama = None;
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
 type SharedBackend = Arc<Mutex<BackendManager>>;
 
+fn has_in_progress_boot(manager: &BackendManager, status: &SetupStatus) -> bool {
+    manager
+        .boot_task
+        .as_ref()
+        .map_or(false, |task| !task.inner().is_finished())
+        && status.error.is_none()
+        && matches!(
+            status.phase.as_str(),
+            "starting" | "ollama" | "model" | "server"
+        )
+}
+
 /// Spawn exactly one tracked boot task. Keeping its handle lets recovery
 /// abort an in-flight endpoint check/model download before killing children.
-async fn start_managed_boot(backend: SharedBackend, status: SharedStatus) {
+async fn start_managed_boot(
+    backend: SharedBackend,
+    status: SharedStatus,
+) -> Result<(), String> {
+    let status_snapshot = status.lock().await.clone();
     let mut manager = backend.lock().await;
+    if manager.untracked_child_unconfirmed {
+        return Err(
+            "Previous backend shutdown is unconfirmed; refusing to start another backend.".into(),
+        );
+    }
+    if manager
+        .boot_task
+        .as_ref()
+        .map_or(false, |task| !task.inner().is_finished())
+    {
+        if has_in_progress_boot(&manager, &status_snapshot) {
+            return Ok(());
+        }
+        return Err("Previous backend startup task is still finishing; retry shortly.".into());
+    }
     if let Some(task) = manager.boot_task.take() {
-        task.abort();
-        let _ = task.await;
+        if let Err(error) = task.await {
+            let message = format!("Could not confirm the previous backend startup task: {error}");
+            manager.untracked_child_unconfirmed = true;
+            drop(manager);
+            status.lock().await.mark_stop_unconfirmed(message.clone());
+            return Err(message);
+        }
+    }
+    if manager.jarvis.is_some() || manager.ollama.is_some() {
+        return Err(
+            "A previous startup still owns backend processes; stop them before retrying.".into(),
+        );
     }
     let task_backend = backend.clone();
     let task = tauri::async_runtime::spawn(boot_backend(task_backend, status));
     manager.boot_task = Some(task);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -523,9 +621,42 @@ impl SetupStatus {
             ..Self::default()
         }
     }
+
+    fn mark_stop_unconfirmed(&mut self, error: String) {
+        self.phase = "stop_unconfirmed".into();
+        self.detail = "Backend shutdown could not be confirmed.".into();
+        self.error = Some(error);
+    }
+
+    fn mark_stopped(&mut self) {
+        if self.source == "unconfigured" {
+            *self = Self::default();
+        } else {
+            self.phase = "stopped".into();
+            self.detail = "Managed backend child processes stopped.".into();
+            self.ollama_ready = false;
+            self.server_ready = false;
+            self.model_ready = false;
+            self.error = None;
+        }
+    }
 }
 
 type SharedStatus = Arc<Mutex<SetupStatus>>;
+
+async fn stop_all_then(
+    backend: &SharedBackend,
+    status: &SharedStatus,
+    after_stop: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let stop_result = backend.lock().await.stop_all().await;
+    if let Err(error) = stop_result {
+        status.lock().await.mark_stop_unconfirmed(error.clone());
+        return Err(error);
+    }
+    status.lock().await.mark_stopped();
+    after_stop()
+}
 
 // ---------------------------------------------------------------------------
 // Health-check helpers
@@ -1067,7 +1198,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         };
 
         if let Some(child) = ollama_child {
-            backend.lock().await.ollama = Some(ChildHandle { child });
+            backend.lock().await.ollama = Some(ChildHandle::new(child));
         }
 
         let ollama_url = format!("http://127.0.0.1:{}/api/tags", OLLAMA_PORT);
@@ -1580,7 +1711,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             let stderr_handle = child.stderr.take();
             let mut mgr = backend.lock().await;
             let tail = mgr.jarvis_stderr_tail.clone();
-            mgr.jarvis = Some(ChildHandle { child });
+            mgr.jarvis = Some(ChildHandle::new(child));
             drop(mgr);
             if let Some(stderr) = stderr_handle {
                 spawn_jarvis_stderr_drainer(stderr, tail);
@@ -1717,19 +1848,27 @@ async fn start_backend(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
 ) -> Result<(), String> {
+    if status.lock().await.phase == "stop_unconfirmed" {
+        return Err(
+            "Previous backend shutdown is unconfirmed; refusing to start another backend.".into(),
+        );
+    }
     if read_configured_inference_config().is_none() {
         *status.lock().await = SetupStatus::default();
         return Err("Choose an inference source before starting OpenJarvis.".into());
     }
     let b = backend.inner().clone();
     let s = status.inner().clone();
-    start_managed_boot(b, s).await;
+    start_managed_boot(b, s).await?;
     Ok(())
 }
 
 #[tauri::command]
-async fn stop_backend(backend: tauri::State<'_, SharedBackend>) -> Result<(), String> {
-    backend.lock().await.stop_all().await;
+async fn stop_backend(
+    backend: tauri::State<'_, SharedBackend>,
+    status: tauri::State<'_, SharedStatus>,
+) -> Result<(), String> {
+    stop_all_then(backend.inner(), status.inner(), || Ok(())).await?;
     Ok(())
 }
 
@@ -1740,8 +1879,12 @@ async fn reset_inference_source(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
 ) -> Result<(), String> {
-    backend.lock().await.stop_all().await;
-    discard_pending_inference_setup()?;
+    stop_all_then(
+        backend.inner(),
+        status.inner(),
+        discard_pending_inference_setup,
+    )
+    .await?;
     *status.lock().await = SetupStatus::default();
     Ok(())
 }
@@ -3393,7 +3536,13 @@ pub fn run() {
             // a source. Fresh installs stay inert until the setup UI records
             // explicit consent and invokes `start_backend`.
             if configured_at_launch.is_some() {
-                tauri::async_runtime::spawn(start_managed_boot(boot_backend_ref, boot_status_ref));
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        start_managed_boot(boot_backend_ref, boot_status_ref).await
+                    {
+                        eprintln!("Could not safely start the managed backend: {error}");
+                    }
+                });
             }
 
             Ok(())
@@ -3436,7 +3585,9 @@ pub fn run() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let b = backend.clone();
                 tauri::async_runtime::spawn(async move {
-                    b.lock().await.stop_all().await;
+                    if let Err(error) = b.lock().await.stop_all().await {
+                        eprintln!("Backend shutdown could not be confirmed during exit: {error}");
+                    }
                 });
             }
         });
@@ -4228,13 +4379,48 @@ mod tests {
 
         let mut manager = BackendManager::default();
         manager.boot_task = Some(tauri::async_runtime::JoinHandle::Tokio(task));
-        manager.stop_all().await;
+        let error = manager.stop_all().await.unwrap_err();
 
+        assert!(error.contains("unregistered child may still be running"));
         assert!(manager.boot_task.is_none());
+        assert!(manager.untracked_child_unconfirmed);
+        assert!(manager
+            .stop_all()
+            .await
+            .unwrap_err()
+            .contains("shutdown remains unconfirmed"));
         assert!(
             dropped.load(Ordering::SeqCst),
             "stop_all must not return before the aborted boot future is dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_reuses_only_a_running_boot_task() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut manager = BackendManager::default();
+        manager.boot_task = Some(tauri::async_runtime::JoinHandle::Tokio(task));
+        let mut status = SetupStatus::starting(&InferenceConfig::default());
+
+        assert!(has_in_progress_boot(&manager, &status));
+
+        status.phase = "ready".into();
+        assert!(!has_in_progress_boot(&manager, &status));
+        status.phase = "server".into();
+        status.error = Some("startup failed".into());
+        assert!(!has_in_progress_boot(&manager, &status));
+
+        let task = manager.boot_task.take().unwrap();
+        task.abort();
+        let _ = task.await;
+
+        let mut completed_task = tokio::spawn(async {});
+        (&mut completed_task).await.unwrap();
+        let mut manager = BackendManager::default();
+        manager.boot_task = Some(tauri::async_runtime::JoinHandle::Tokio(completed_task));
+        status.phase = "server".into();
+        status.error = None;
+        assert!(!has_in_progress_boot(&manager, &status));
     }
 
     #[test]
@@ -4244,7 +4430,11 @@ mod tests {
         };
         let completed = std::env::var_os("OPENJARVIS_OWNED_CHILD_COMPLETED").unwrap();
         std::fs::write(started, "started").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        let sleep_ms = std::env::var("OPENJARVIS_OWNED_CHILD_SLEEP_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(500);
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         std::fs::write(completed, "completed").unwrap();
     }
 
@@ -4274,6 +4464,7 @@ mod tests {
             ])
             .env("OPENJARVIS_OWNED_CHILD_STARTED", started_for_child)
             .env("OPENJARVIS_OWNED_CHILD_COMPLETED", completed_for_child)
+            .env("OPENJARVIS_OWNED_CHILD_SLEEP_MS", "500")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
             let child = spawn_owned_child(&mut cmd).unwrap();
@@ -4300,6 +4491,112 @@ mod tests {
             "an aborted boot task left its not-yet-registered child running"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn spawn_owned_child_helper(
+        started: &Path,
+        completed: &Path,
+    ) -> tokio::process::Child {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::owned_child_process_helper", "--nocapture"])
+            .env("OPENJARVIS_OWNED_CHILD_STARTED", started)
+            .env("OPENJARVIS_OWNED_CHILD_COMPLETED", completed)
+            .env("OPENJARVIS_OWNED_CHILD_SLEEP_MS", "30000")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = spawn_owned_child(&mut command).unwrap();
+        for _ in 0..100 {
+            if started.exists() {
+                return child;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("owned child helper did not start");
+    }
+
+    #[tokio::test]
+    async fn stop_all_keeps_failed_child_and_stops_other_children() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("openjarvis-stop-child-{unique}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let jarvis_started = root.join("jarvis-started");
+        let jarvis_completed = root.join("jarvis-completed");
+        let ollama_started = root.join("ollama-started");
+        let ollama_completed = root.join("ollama-completed");
+        let jarvis = spawn_owned_child_helper(&jarvis_started, &jarvis_completed).await;
+        let ollama = spawn_owned_child_helper(&ollama_started, &ollama_completed).await;
+        let mut manager = BackendManager::default();
+        manager.jarvis = Some(ChildHandle::new(jarvis));
+        manager.ollama = Some(ChildHandle::new(ollama));
+        manager.jarvis.as_mut().unwrap().fail_kill = true;
+
+        let error = manager.stop_all().await.unwrap_err();
+
+        assert!(error.contains("injected child stop failure"));
+        assert!(manager.jarvis.is_some(), "failed child ownership must be retained");
+        assert!(manager.ollama.is_none(), "other children should still be stopped");
+        assert!(manager.jarvis.as_mut().unwrap().child.try_wait().unwrap().is_none());
+
+        manager.jarvis.as_mut().unwrap().fail_kill = false;
+        manager.stop_all().await.unwrap();
+        assert!(manager.jarvis.is_none());
+        assert!(!jarvis_completed.exists());
+        assert!(!ollama_completed.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stop_unconfirmed_status_preserves_last_known_readiness() {
+        let config = InferenceConfig::default();
+        let mut status = SetupStatus::starting(&config);
+        status.server_ready = true;
+
+        status.mark_stop_unconfirmed("child termination failed".into());
+
+        assert_eq!(status.phase, "stop_unconfirmed");
+        assert!(status.server_ready, "failure must not claim the backend stopped");
+        assert_eq!(status.error.as_deref(), Some("child termination failed"));
+    }
+
+    #[test]
+    fn stopped_status_clears_readiness_only_after_confirmed_cleanup() {
+        let config = InferenceConfig::default();
+        let mut status = SetupStatus::starting(&config);
+        status.server_ready = true;
+        status.ollama_ready = true;
+        status.model_ready = true;
+
+        status.mark_stopped();
+
+        assert_eq!(status.phase, "stopped");
+        assert!(!status.server_ready);
+        assert!(!status.ollama_ready);
+        assert!(!status.model_ready);
+    }
+
+    #[tokio::test]
+    async fn reset_does_not_discard_config_when_shutdown_is_unconfirmed() {
+        let backend = Arc::new(Mutex::new(BackendManager {
+            untracked_child_unconfirmed: true,
+            ..BackendManager::default()
+        }));
+        let status = Arc::new(Mutex::new(SetupStatus::default()));
+        let mut config_discarded = false;
+
+        let result = stop_all_then(&backend, &status, || {
+            config_discarded = true;
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(!config_discarded);
+        assert_eq!(status.lock().await.phase, "stop_unconfirmed");
+        assert!(backend.lock().await.untracked_child_unconfirmed);
     }
 
     #[test]
