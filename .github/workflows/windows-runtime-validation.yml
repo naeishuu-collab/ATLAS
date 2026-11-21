@@ -1,0 +1,136 @@
+name: Windows Runtime Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validation:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Validate requested source SHA
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          if ($env:EXPECTED_SOURCE_SHA -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'source_sha must be a full 40-character commit SHA.'
+          }
+
+      - uses: actions/checkout@v7
+        id: checkout
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm checked-out commit
+        shell: pwsh
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_SOURCE_SHA.ToLowerInvariant()) {
+            throw "Checked out $actual instead of the requested source SHA."
+          }
+          New-Item -ItemType Directory -Path validation-evidence -Force | Out-Null
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13.18'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.23.5'
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.8'
+          enable-cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.89.0'
+          components: rustfmt
+
+      - name: Pin npm and record toolchains
+        shell: pwsh
+        run: |
+          npm install --global npm@11.19.0
+          $metadata = [ordered]@{
+            source_sha = (git rev-parse HEAD).Trim()
+            runner_os = (Get-CimInstance Win32_OperatingSystem).Caption
+            python = (python --version 2>&1 | Out-String).Trim()
+            node = (node --version).Trim()
+            npm = (npm --version).Trim()
+            rustc = (rustc --version).Trim()
+            cargo = (cargo --version).Trim()
+            uv = (uv --version).Trim()
+          }
+          $metadata | ConvertTo-Json | Set-Content -Encoding utf8 validation-evidence\provenance.json
+
+      - name: Frontend tests and Tauri assets
+        shell: pwsh
+        working-directory: frontend
+        run: |
+          npm ci 2>&1 | Tee-Object -FilePath ..\validation-evidence\npm-ci.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm test 2>&1 | Tee-Object -FilePath ..\validation-evidence\frontend-vitest.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build:tauri 2>&1 | Tee-Object -FilePath ..\validation-evidence\frontend-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Locked Python setup
+        shell: pwsh
+        run: |
+          uv sync --locked --extra dev --extra server --group desktop-native 2>&1 | Tee-Object -FilePath validation-evidence\uv-sync.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Python security and lifecycle tests
+        shell: pwsh
+        run: |
+          uv run ruff check src tests 2>&1 | Tee-Object -FilePath validation-evidence\ruff.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run pytest tests\control\test_sprint17_job_recovery.py tests\control\test_sprint15_job_exit.py tests\agents\test_sprint15_task_authority.py tests\agents\test_task_checkpoint_binding.py tests\control\test_sprint15_task_worker_ipc.py tests\control\test_host_supervisor_sessions.py tests\control\test_host_supervisor_broker.py tests\control\test_host_task_supervisor.py tests\control\test_windows_named_pipe.py tests\integration\test_host_bootstrap_ipc.py tests\integration\test_host_supervisor_controller.py tests\integration\test_host_supervisor_crash_e2e.py tests\integration\test_sprint15_host_lease_recheck.py tests\integration\test_phase1_sprint15_controller_worker_e2e.py 2>&1 | Tee-Object -FilePath validation-evidence\python-focused.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Rust formatting, tests, and Tauri build
+        shell: pwsh
+        run: |
+          cargo fmt --manifest-path frontend/src-tauri/Cargo.toml -- --check 2>&1 | Tee-Object -FilePath validation-evidence\rustfmt.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml 2>&1 | Tee-Object -FilePath validation-evidence\tauri-rust-tests.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --manifest-path frontend/src-tauri/Cargo.toml 2>&1 | Tee-Object -FilePath validation-evidence\tauri-build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify lockfiles and create evidence hashes
+        shell: pwsh
+        if: always() && steps.checkout.outcome == 'success'
+        run: |
+          git diff --exit-code -- uv.lock frontend/package-lock.json frontend/src-tauri/Cargo.lock rust/Cargo.lock
+          $lockExit = $LASTEXITCODE
+          $rows = Get-ChildItem -LiteralPath validation-evidence -File | Where-Object Name -ne 'sha256-manifest.json' | Sort-Object Name | ForEach-Object {
+            [ordered]@{ path = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() }
+          }
+          [ordered]@{ algorithm = 'SHA256'; manifest_excludes_itself = $true; files = @($rows) } |
+            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 validation-evidence\sha256-manifest.json
+          if ($lockExit -ne 0) { exit $lockExit }
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: windows-runtime-validation-${{ inputs.source_sha }}
+          path: validation-evidence/
+          if-no-files-found: ignore
+          retention-days: 14
