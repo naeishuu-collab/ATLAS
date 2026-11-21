@@ -180,8 +180,8 @@ class HostTaskSupervisorProcess:
             "host-supervisor",
             self.binding["supervisor_id"],
             executable,
-            max_processes=256,
-            max_runtime=24 * 60 * 60,
+            max_processes=2,
+            max_runtime=60 * 60,
         )
         try:
             command = [
