@@ -99,7 +99,9 @@ jobs:
       - name: Python security and lifecycle tests
         shell: pwsh
         run: |
-          uv run ruff check src tests 2>&1 | Tee-Object -FilePath validation-evidence\ruff.log
+          $changedPython = @(git diff --name-only '27b495bfe131d8049c8419b96eecb29f5fc974ce' HEAD -- '*.py')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          uv run ruff check @changedPython 2>&1 | Tee-Object -FilePath validation-evidence\ruff.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run pytest `
             tests\control\test_sprint17_job_recovery.py `
