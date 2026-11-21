@@ -473,11 +473,41 @@ class SandboxedProcess:
         self._timer.join()
         with self._job_lock:
             if not self.closed:
+                poll = getattr(self.process, "poll", None)
                 try:
-                    self.terminate()
+                    process_running = not callable(poll) or poll() is None
                 except Exception as exc:
+                    process_running = True
                     if self._first_error is None:
                         self._first_error = exc
+                if process_running:
+                    try:
+                        self.terminate()
+                    except Exception as exc:
+                        if self._first_error is None:
+                            self._first_error = exc
+                else:
+                    # Let Job accounting catch up with an already-exited process
+                    # before deciding that a descendant needs forced termination.
+                    deadline = time.monotonic() + 0.1
+                    active = 1
+                    while active:
+                        try:
+                            active = self.job.active_processes()
+                        except Exception as exc:
+                            active = 1
+                            if self._first_error is None:
+                                self._first_error = exc
+                            break
+                        if not active or time.monotonic() >= deadline:
+                            break
+                        threading.Event().wait(0.01)
+                    if active:
+                        try:
+                            self.terminate()
+                        except Exception as exc:
+                            if self._first_error is None:
+                                self._first_error = exc
                 try:
                     self.observed_exit_code = self.process.wait(timeout=2.0)
                     self.process_wait_confirmed = True

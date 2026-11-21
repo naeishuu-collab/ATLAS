@@ -879,3 +879,39 @@ def test_multi_process_job_close_confirms_drain():
 
     assert evidence["job_exit_confirmed"] is True
     assert evidence["closed"] is True
+
+
+def test_job_close_waits_for_natural_drain_before_terminating():
+    class Process:
+        pid = 123
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout):
+            return self.returncode
+
+    class Job:
+        limits = {}
+        active = iter((1, 1, 0, 0))
+
+        def active_processes(self):
+            return next(self.active)
+
+        def terminate(self):
+            pytest.fail("natural Job drain must not be reported as forced")
+
+        def close(self):
+            pass
+
+    sandbox = SandboxedProcess(
+        Process(), Job(), SandboxPolicy("fixture", "natural-drain", "python"), True,
+        pre_start_containment=True,
+    )
+
+    evidence = sandbox.close()
+
+    assert evidence["job_exit_confirmed"] is True
+    assert evidence["forced_termination"] is False
+    assert evidence["observed_exit_code"] == 0
