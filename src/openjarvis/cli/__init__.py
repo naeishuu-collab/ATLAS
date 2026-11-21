@@ -31,6 +31,8 @@ def _should_skip_update_check(ctx: click.Context, argv: list[str]) -> bool:
     """Return true for commands whose diagnostics should remain local-only."""
     if "--research" in argv:
         return True
+    if ctx.invoked_subcommand == "host-supervisor":
+        return True
     return ctx.invoked_subcommand == "scan" and "--data-boundaries" in argv
 
 
@@ -116,6 +118,7 @@ if not _DATA_BOUNDARY_BOOTSTRAP:
     from openjarvis.cli.gateway_cmd import gateway
     from openjarvis.cli.gui_cmd import gui
     from openjarvis.cli.host_cmd import host
+    from openjarvis.cli.host_supervisor_cmd import host_supervisor
     from openjarvis.cli.init_cmd import init
     from openjarvis.cli.memory_cmd import memory
     from openjarvis.cli.mine_cmd import mine
@@ -160,6 +163,7 @@ if not _DATA_BOUNDARY_BOOTSTRAP:
     cli.add_command(operators, "operators")
     cli.add_command(eval_group, "eval")
     cli.add_command(host, "host")
+    cli.add_command(host_supervisor, "host-supervisor")
     cli.add_command(quickstart, "quickstart")
     cli.add_command(optimize_group, "optimize")
     cli.add_command(feedback_group, "feedback")

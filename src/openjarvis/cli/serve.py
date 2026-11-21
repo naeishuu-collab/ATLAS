@@ -53,7 +53,21 @@ def _load_shadow_host_supply(capability_policy=None, scanners=()):
     )
 
     return load_host_supply_from_env(
-        scanners=scanners, capability_policy=capability_policy)
+        scanners=scanners, capability_policy=capability_policy
+    )
+
+
+def _host_supervisor_factory(host_bootstrap):
+    """Bind Controller task sessions to the Host-issued Windows grant channel."""
+    from openjarvis.control.host_supervisor_broker import HostSupervisorClient
+
+    def create(binding, validate_authority):
+        grant = host_bootstrap.issue(binding, validate_authority=validate_authority)
+        return HostSupervisorClient(
+            grant, binding, validate_authority=validate_authority
+        )
+
+    return create
 
 
 def _resolve_allowed_tools(config: object) -> tuple[set[str], bool]:
@@ -150,6 +164,9 @@ def _resolve_server_model(
     default=None,
     help="Agent for chat requests (simple, orchestrator, react, openhands).",
 )
+@click.option("--host-bootstrap-pipe", default=None, hidden=True)
+@click.option("--host-supervisor-pid", type=int, default=None, hidden=True)
+@click.option("--host-supervisor-created-filetime", type=int, default=None, hidden=True)
 @click.pass_context
 def serve(
     ctx: click.Context,
@@ -158,6 +175,9 @@ def serve(
     engine_key: str | None,
     model_name: str | None,
     agent_name: str | None,
+    host_bootstrap_pipe: str | None,
+    host_supervisor_pid: int | None,
+    host_supervisor_created_filetime: int | None,
 ) -> None:
     """Start the OpenAI-compatible API server."""
     print_banner(quiet=(ctx.obj or {}).get("quiet", False))
@@ -185,6 +205,42 @@ def serve(
     # Resolve host/port from CLI args or config
     bind_host = host or config.server.host
     bind_port = port if port is not None else config.server.port
+
+    host_bootstrap = None
+    bootstrap_args = (
+        host_bootstrap_pipe,
+        host_supervisor_pid,
+        host_supervisor_created_filetime,
+    )
+    if any(value is not None for value in bootstrap_args):
+        if any(value is None for value in bootstrap_args):
+            raise click.ClickException("incomplete Windows Host bootstrap settings")
+        try:
+            from openjarvis.control.host_supervisor_bootstrap import (
+                HostSupervisorBootstrapClient,
+            )
+
+            host_bootstrap = HostSupervisorBootstrapClient(
+                host_bootstrap_pipe,
+                supervisor_pid=host_supervisor_pid,
+                supervisor_created_filetime=host_supervisor_created_filetime,
+            ).bootstrap()
+        except Exception as exc:
+            raise click.ClickException("Windows Host bootstrap failed closed") from exc
+        try:
+            import ipaddress
+
+            is_loopback = ipaddress.ip_address(bind_host).is_loopback
+        except ValueError:
+            is_loopback = bind_host in ("localhost", "")
+        if not is_loopback:
+            raise click.ClickException(
+                "Windows Host-managed Controller must bind to loopback"
+            )
+        if not config.agent_manager.enabled:
+            raise click.ClickException(
+                "Windows Host-managed Controller requires Agent Manager"
+            )
 
     # Set up engine
     register_builtin_models()
@@ -228,7 +284,8 @@ def serve(
     engine = sec.engine
     # Host-issued supply authority (shadow/cloud): one load per server.
     host_supply = _load_shadow_host_supply(
-        capability_policy=sec.capability_policy, scanners=sec.scanners)
+        capability_policy=sec.capability_policy, scanners=sec.scanners
+    )
 
     # If cloud API keys are set, prepare a cloud engine. We build the
     # MultiEngine after local discovery so healthy local fallbacks such as
@@ -249,12 +306,9 @@ def serve(
             # unconfigured host keeps the default-deny bare engine. The
             # engine itself can never mint its own authorization.
             cloud_engine = CloudEngine(
-                authorizer=(host_supply.cloud_authorizer
-                            if host_supply else None),
-                dispatch_ledger=(host_supply.dispatch_ledger
-                                 if host_supply else None),
-                session_id=(host_supply.session_id
-                            if host_supply else ""),
+                authorizer=(host_supply.cloud_authorizer if host_supply else None),
+                dispatch_ledger=(host_supply.dispatch_ledger if host_supply else None),
+                session_id=(host_supply.session_id if host_supply else ""),
             )
             if cloud_engine.health():
                 console.print("  Cloud:  [cyan]enabled[/cyan] (API keys detected)")
@@ -627,9 +681,14 @@ def serve(
             # The server owns the scheduler and is the authoritative tick
             # runner — on boot it holds no locks, so it (and only it) sweeps
             # any zombie running→idle left by a previous crash.
-            agent_manager = AgentManager(db_path=am_db, clear_stale_running=True)
+            agent_manager = AgentManager(
+                db_path=am_db,
+                clear_stale_running=host_bootstrap is None,
+            )
         except Exception as exc:
             logger.debug("Agent manager init failed: %s", exc)
+    if host_bootstrap is not None and agent_manager is None:
+        raise click.ClickException("Windows Host Agent Manager unavailable")
 
     # Set up agent scheduler for cron/interval agents
     agent_scheduler = None
@@ -807,6 +866,27 @@ def serve(
         api_key=api_key,
         webhook_config=webhook_config,
         cors_origins=cors_origins,
+        host_principal_authority=(
+            host_bootstrap.authority if host_bootstrap is not None else None
+        ),
+        host_principal_context=(
+            host_bootstrap.principal_context if host_bootstrap is not None else None
+        ),
+        task_checkpoint_integrity_key=(
+            host_bootstrap.integrity_key if host_bootstrap is not None else None
+        ),
+        task_worker_supervisor_factory=(
+            _host_supervisor_factory(host_bootstrap)
+            if host_bootstrap is not None
+            else None
+        ),
+        host_supervisor_observer=(
+            lambda task_id, agent_id, principal: (
+                host_bootstrap.observer(task_id, agent_id, principal, agent_manager)
+                if host_bootstrap is not None and agent_manager is not None
+                else None
+            )
+        ),
     )
 
     console.print(

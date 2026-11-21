@@ -679,9 +679,7 @@ class ToolExecutor:
                 if journal_token is None:
                     with self._mutation_lock:
                         self._mutation_states.pop(tool_call.name, None)
-                    semantic_state = semantic_reservation.get(
-                        "state", "NOT_STARTED"
-                    )
+                    semantic_state = semantic_reservation.get("state", "NOT_STARTED")
                     semantic_failure = semantic_reservation.get(
                         "failure", "SEMANTIC_INTENT_BLOCKED"
                     )
@@ -799,8 +797,10 @@ class ToolExecutor:
         outcome = ExecutionOutcome(ExecutionState.EXECUTED, call_id=tool_call.id)
         future = None
         result = None
+        task_worker_result = False
         checkpoint_blocked = False
         dispatch_authorized = True
+        task_worker_dispatch = getattr(self, "_task_worker_dispatch", None)
         if checkpoint_callback is not None:
             try:
                 checkpoint_callback("PREPARED", None)
@@ -915,13 +915,23 @@ class ToolExecutor:
                 from openjarvis.security.runtime import _tool_execution_authority
 
                 def invoke_tool(**tool_params: Any) -> ToolResult:
+                    task_authority_check = getattr(self, "_task_authority_check", None)
+                    if task_authority_check is not None:
+                        task_authority_check()
                     with _tool_execution_authority(
                         required_capabilities,
                         resources=capability_resources,
                     ):
                         return tool.execute(**tool_params)
 
-                future = _TOOL_RUNNER.submit(invoke_tool, **params)
+                if task_worker_dispatch is None:
+                    future = _TOOL_RUNNER.submit(invoke_tool, **params)
+                else:
+                    task_authority_check = getattr(self, "_task_authority_check", None)
+                    if task_authority_check is not None:
+                        task_authority_check()
+                    result = task_worker_dispatch(tool_call, params, timeout=timeout)
+                    task_worker_result = True
                 if (
                     future is not None
                     and mutating
@@ -949,7 +959,7 @@ class ToolExecutor:
                             },
                         },
                     )
-            if future is None:
+            if future is None and not task_worker_result:
                 if not checkpoint_blocked and dispatch_authorized:
                     outcome = ExecutionOutcome(
                         ExecutionState.NOT_STARTED,
@@ -966,7 +976,11 @@ class ToolExecutor:
                         success=False,
                     )
             else:
-                result = future.result(timeout=timeout)
+                if future is not None:
+                    result = future.result(timeout=timeout)
+                    task_authority_check = getattr(self, "_task_authority_check", None)
+                    if task_authority_check is not None:
+                        task_authority_check()
                 if not isinstance(result, ToolResult):
                     raise TypeError("Tool must return a ToolResult")
                 if not result.success:
@@ -1058,20 +1072,25 @@ class ToolExecutor:
                 "outcome": outcome.state.value,
             }
         except Exception as exc:
+            unknown = bool(getattr(exc, "unknown_outcome", False))
             outcome = ExecutionOutcome(
                 ExecutionState.UNKNOWN_OUTCOME
-                if mutating and future is not None
+                if unknown or mutating and future is not None
                 else ExecutionState.NOT_STARTED
                 if future is None
                 else ExecutionState.EXECUTED,
                 FailureKind.UNKNOWN_OUTCOME
-                if mutating and future is not None
+                if unknown or mutating and future is not None
                 else FailureKind.TOOL_FAILURE,
                 call_id=tool_call.id,
             )
             result = ToolResult(
                 tool_name=tool_call.name,
-                content=f"Tool execution error: {exc}",
+                content=(
+                    f"UNKNOWN_OUTCOME: {exc}"
+                    if unknown
+                    else f"Tool execution error: {exc}"
+                ),
                 success=False,
             )
         latency = time.perf_counter() - t0
@@ -1085,6 +1104,13 @@ class ToolExecutor:
         if checkpoint_callback is not None and not checkpoint_blocked:
             try:
                 checkpoint_callback(outcome.state.value, result)
+                task_checkpointed = getattr(self, "_task_worker_checkpointed", None)
+                if (
+                    task_worker_result
+                    and result.success
+                    and task_checkpointed is not None
+                ):
+                    task_checkpointed(result)
             except Exception as exc:
                 checkpoint_failed = True
                 logger.exception("Could not persist managed tool checkpoint")

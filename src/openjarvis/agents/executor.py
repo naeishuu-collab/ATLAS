@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -118,9 +119,13 @@ class _ManagedMutationController:
         ):
             raise ValueError("checkpoint and durable plan identity disagree")
         persisted_revision_id = self._tool_state.get("revision_id")
-        if raw_plan is not None and persisted_revision_id is not None and (
-            not isinstance(persisted_revision_id, str)
-            or persisted_revision_id != self._plan.revision_id
+        if (
+            raw_plan is not None
+            and persisted_revision_id is not None
+            and (
+                not isinstance(persisted_revision_id, str)
+                or persisted_revision_id != self._plan.revision_id
+            )
         ):
             raise ValueError("checkpoint and durable plan revision disagree")
         self._intent: MutationIntent | None = None
@@ -264,9 +269,7 @@ class _ManagedMutationController:
                 self._execution_id,
                 step_id,
                 f"intent-{uuid.uuid4().hex}",
-                node.arguments_sha256
-                if self._plan.argument_binding_required
-                else None,
+                node.arguments_sha256 if self._plan.argument_binding_required else None,
             )
             self._journal.authorize_intent(self._scope, intent)
             self._intent = intent
@@ -653,8 +656,7 @@ class _ManagedMutationController:
         if proposal.reserved_fields:
             fields = ", ".join(proposal.reserved_fields)
             raise PlanProposalError(
-                "PLAN_PROPOSAL_REJECTED: authority fields are not accepted "
-                f"({fields})"
+                f"PLAN_PROPOSAL_REJECTED: authority fields are not accepted ({fields})"
             )
         if supported_tools is not None:
             supported = set(supported_tools)
@@ -838,9 +840,7 @@ class _ManagedMutationController:
         self._plan.tool_binding_required = True
         self._plan.argument_binding_required = True
         self._plan.schema_binding_required = True
-        self._plan.append_revision(
-            reason="REPLAN", proposal_id=proposal.proposal_id
-        )
+        self._plan.append_revision(reason="REPLAN", proposal_id=proposal.proposal_id)
         self._intent = None
         self._status = None
         self._next_step_id = local_to_node[roots[0]]
@@ -1557,9 +1557,10 @@ class AgentExecutor:
         if cancellation is None:
             return
         self._manager.advance_cancellation(agent_id, "ACKNOWLEDGED")
-        cancellation = self._manager.advance_cancellation(
-            agent_id, "SAFE_BOUNDARY_REACHED"
-        ) or cancellation
+        cancellation = (
+            self._manager.advance_cancellation(agent_id, "SAFE_BOUNDARY_REACHED")
+            or cancellation
+        )
         tool_state = dict(runtime.get("tool_state") or {})
         tool_state["cancellation"] = cancellation
         history = list(tool_state.get("retry_history", []))
@@ -1583,9 +1584,10 @@ class AgentExecutor:
                 lifecycle=lifecycle,
                 result=result,
             )
-            cancellation = self._manager.advance_cancellation(
-                agent_id, "TERMINALIZED"
-            ) or cancellation
+            cancellation = (
+                self._manager.advance_cancellation(agent_id, "TERMINALIZED")
+                or cancellation
+            )
             runtime["tool_state"]["cancellation"] = cancellation
             self._manager.end_tick(agent_id)
             self._manager.update_agent(
@@ -1638,6 +1640,24 @@ class AgentExecutor:
             "resumable": bool(runtime.get("resumable", False)),
             "messages": _checkpoint_messages(messages),
         }
+        task_context = runtime.get("task_context")
+        if task_context is not None:
+            conversation_state["task_id"] = task_context["task_id"]
+            if task_context.get("execution_attempt") is not None:
+                task_context["heartbeat_check"]()
+                tool_state = {
+                    **tool_state,
+                    "worker_epoch": task_context["worker_epoch"],
+                }
+                self._manager.renew_task_authority(
+                    task_context["task_id"],
+                    runtime["agent_id"],
+                    task_context["principal"],
+                    task_context["authority"],
+                    task_context["execution_attempt"],
+                    task_context.get("worker_token"),
+                    task_context.get("worker_epoch"),
+                )
         if runtime.get("deadline_at") is not None:
             conversation_state["deadline_at"] = runtime["deadline_at"]
         cancellation = self._manager.cancellation_state(runtime["agent_id"])
@@ -1654,6 +1674,20 @@ class AgentExecutor:
         saved = self._manager.save_checkpoint(
             runtime["agent_id"], tick_id, conversation_state, persisted_tool_state
         )
+        if task_context is not None:
+            principal = task_context["principal"]
+            runtime["task_checkpoint_version"] = self._manager.bind_task_checkpoint(
+                task_context["task_id"],
+                runtime["agent_id"],
+                principal,
+                task_context["authority"],
+                saved["id"],
+                persisted_tool_state["execution_id"],
+                integrity_key=task_context["integrity_key"],
+                expected_version=runtime.get("task_checkpoint_version", 0),
+                worker_token=task_context.get("worker_token"),
+                worker_epoch=task_context.get("worker_epoch"),
+            )
         runtime["conversation_state"] = conversation_state
         runtime["tool_state"] = persisted_tool_state
         runtime["checkpoint_id"] = saved["id"]
@@ -1812,13 +1846,9 @@ class AgentExecutor:
                     plan.execution_id,
                     node.planner_node_id,
                     node.mutation_intent_id,
-                    node.arguments_sha256
-                    if plan.argument_binding_required
-                    else None,
+                    node.arguments_sha256 if plan.argument_binding_required else None,
                 )
-                row = self._manager.execution_journal.semantic_intent(
-                    agent_id, intent
-                )
+                row = self._manager.execution_journal.semantic_intent(agent_id, intent)
                 if row is None:
                     raise ValueError("planner node is absent from the semantic journal")
                 if node.status == "COMPLETED" and row["status"] != "VERIFIED":
@@ -1838,9 +1868,7 @@ class AgentExecutor:
                 raise ValueError("managed semantic execution identity disagrees")
             if semantic.get("status") not in _SEMANTIC_STEP_STATES:
                 raise ValueError("managed semantic step state is invalid")
-            row = self._manager.execution_journal.semantic_intent(
-                agent_id, intent
-            )
+            row = self._manager.execution_journal.semantic_intent(agent_id, intent)
             if row is None or not semantic_status_can_advance(
                 semantic["status"], row["status"]
             ):
@@ -1857,9 +1885,7 @@ class AgentExecutor:
             present = [key in step for key in keys]
             if not any(present):
                 continue
-            if not all(
-                isinstance(step.get(key), str) and step[key] for key in keys
-            ):
+            if not all(isinstance(step.get(key), str) and step[key] for key in keys):
                 raise ValueError("managed step identity is incomplete")
             intent = MutationIntent(
                 step["execution_id"],
@@ -1929,9 +1955,12 @@ class AgentExecutor:
             "messages": _checkpoint_messages(messages),
             "failure": reason[:2000],
         }
-        if isinstance(old_conversation, dict) and old_conversation.get(
-            "deadline_at"
-        ) is not None:
+        if isinstance(old_conversation, dict) and old_conversation.get("task_id"):
+            recovery_conversation["task_id"] = old_conversation["task_id"]
+        if (
+            isinstance(old_conversation, dict)
+            and old_conversation.get("deadline_at") is not None
+        ):
             recovery_conversation["deadline_at"] = old_conversation["deadline_at"]
         cancellation = self._manager.cancellation_state(agent_id)
         if cancellation is not None:
@@ -2001,6 +2030,8 @@ class AgentExecutor:
             return None, None, False
 
         conversation = checkpoint.get("conversation_state")
+        if isinstance(conversation, dict) and conversation.get("task_id"):
+            return None, "task checkpoint resume requires reauthorization", candidate
         if not isinstance(conversation, dict) or "schema_version" not in conversation:
             if candidate or pending:
                 return (
@@ -2194,11 +2225,15 @@ class AgentExecutor:
                     "terminal cancellation contradicts pending mutation journal",
                     True,
                 )
-            return {
-                "completed": True,
-                "cancelled": True,
-                "agent_id": agent_id,
-            }, None, candidate
+            return (
+                {
+                    "completed": True,
+                    "cancelled": True,
+                    "agent_id": agent_id,
+                },
+                None,
+                candidate,
+            )
         if not candidate:
             if lifecycle in {"RUNNING", "FAILED"}:
                 return (
@@ -2243,13 +2278,17 @@ class AgentExecutor:
                 prepared_reconciled = bool(
                     record and record.get("resolution") == "NOT_EXECUTED"
                 )
-            if cancellation is not None and not pending and (
-                safe_unverified
-                or prepared_reconciled
-                or effect == "READ_ONLY"
-                or (
-                    active.get("state") == "VERIFIED"
-                    and active.get("execution_state") == "VERIFIED"
+            if (
+                cancellation is not None
+                and not pending
+                and (
+                    safe_unverified
+                    or prepared_reconciled
+                    or effect == "READ_ONLY"
+                    or (
+                        active.get("state") == "VERIFIED"
+                        and active.get("execution_state") == "VERIFIED"
+                    )
                 )
             ):
                 runtime = {
@@ -2431,7 +2470,13 @@ class AgentExecutor:
         )
         return agent.run(input_text)
 
-    def execute_tick(self, agent_id: str, *, lock_already_held: bool = False) -> None:
+    def execute_tick(
+        self,
+        agent_id: str,
+        *,
+        lock_already_held: bool = False,
+        task_context: dict[str, Any] | None = None,
+    ) -> AgentResult | None:
         """Run one tick for the given agent.
 
         1. Acquire concurrency guard (start_tick)
@@ -2446,6 +2491,72 @@ class AgentExecutor:
         guard — bailing out with no end_tick(), leaving the agent stuck in
         ``status='running'`` forever.
         """
+        if task_context is not None:
+            if not isinstance(task_context, dict):
+                raise PermissionError("trusted task context required")
+            task_context = dict(task_context)
+            task_id = task_context.get("task_id")
+            principal = task_context.get("principal")
+            authority = task_context.get("authority")
+            key = task_context.get("integrity_key")
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or not callable(getattr(authority, "accepts", None))
+                or not authority.accepts(principal)
+                or not isinstance(key, bytes)
+                or len(key) < 32
+                or self._manager._get_task(task_id, agent_id=agent_id) is None
+            ):
+                raise PermissionError("trusted task context required")
+            task = self._manager._get_task(task_id, agent_id=agent_id)
+            if task_context.get("execution_attempt") is not None and (
+                task is None
+                or task["status"] != "running"
+                or task["principal_id"] != principal.principal_id
+                or task["execution_attempt"] != task_context["execution_attempt"]
+                or task["state_version"] != task_context.get("state_version")
+                or task["host_session_id"] != task_context.get("host_session_id")
+            ):
+                raise PermissionError("trusted task context is stale")
+            if task_context.get("execution_attempt") is not None:
+                if not callable(task_context.get("heartbeat_check")):
+                    raise PermissionError("task heartbeat is required")
+                task_context["heartbeat_check"]()
+                self._manager.validate_task_authority(
+                    task_id,
+                    agent_id,
+                    principal,
+                    authority,
+                    task_context["execution_attempt"],
+                    task_context.get("worker_token"),
+                    task_context.get("worker_epoch"),
+                )
+        try:
+            latest = self._manager.get_latest_checkpoint(agent_id)
+        except Exception:
+            latest = None
+        conversation = latest.get("conversation_state") if latest else None
+        prior_task_id = (
+            conversation.get("task_id") if isinstance(conversation, dict) else None
+        )
+        prior_task = (
+            self._manager._get_task(prior_task_id, agent_id=agent_id)
+            if isinstance(prior_task_id, str)
+            else None
+        )
+        completed_prior_task = (
+            task_context is not None
+            and isinstance(conversation, dict)
+            and prior_task_id != task_context.get("task_id")
+            and conversation.get("lifecycle") == "COMPLETED"
+            and prior_task is not None
+            and prior_task["status"] == "completed"
+        )
+        # shortcut: task resume disabled, upgrade when lease reauthorization is wired.
+        if prior_task_id and not completed_prior_task:
+            raise PermissionError("task checkpoint resume requires reauthorization")
+
         if lock_already_held:
             self._set_activity(agent_id, "Preparing tick...")
         else:
@@ -2461,10 +2572,16 @@ class AgentExecutor:
             logger.error("Agent %s not found", agent_id)
             return
 
-        runtime, recovery_error, _ = self._resume_runtime(agent_id)
+        if completed_prior_task:
+            runtime, recovery_error = None, None
+        else:
+            runtime, recovery_error, _ = self._resume_runtime(agent_id)
         if recovery_error:
             self._require_recovery(agent_id, recovery_error)
             return
+        if task_context is not None and runtime is not None:
+            self._manager.end_tick(agent_id)
+            raise PermissionError("task checkpoint resume requires reauthorization")
         cancellation = self._manager.cancellation_state(agent_id)
         if runtime and runtime.get("completed"):
             if cancellation is not None:
@@ -2523,9 +2640,7 @@ class AgentExecutor:
             self._terminalize_cancellation(agent_id, runtime)
             return
         if runtime is None:
-            timeout_seconds = agent.get("config", {}).get(
-                "overall_timeout_seconds", 0
-            )
+            timeout_seconds = agent.get("config", {}).get("overall_timeout_seconds", 0)
             deadline_at = None
             if (
                 type(timeout_seconds) in {int, float}
@@ -2539,7 +2654,11 @@ class AgentExecutor:
                 "resumable": False,
                 "conversation_state": {},
                 "tool_state": {
-                    "execution_id": uuid.uuid4().hex,
+                    "execution_id": (
+                        task_context.get("execution_attempt") or uuid.uuid4().hex
+                        if task_context is not None
+                        else uuid.uuid4().hex
+                    ),
                     "active_step": {"state": "NOT_STARTED"},
                     "completed_steps": [],
                     "retry_count": 0,
@@ -2548,6 +2667,8 @@ class AgentExecutor:
             }
             if deadline_at is not None:
                 runtime["deadline_at"] = deadline_at
+            if task_context is not None:
+                runtime["task_context"] = task_context
             try:
                 self._persist_tick_state(runtime, [], runtime["tool_state"])
             except Exception as exc:
@@ -2750,6 +2871,10 @@ class AgentExecutor:
                 )
             if deadline_timer is not None:
                 deadline_timer.cancel()
+            task_toolkit = runtime.pop("_task_toolkit", None)
+            if task_toolkit is not None:
+                task_toolkit.close()
+        return result
 
     def _run_with_retries(self, agent: dict) -> AgentResult:
         """Invoke within a checkpointed attempt budget, retrying transient errors."""
@@ -2825,8 +2950,7 @@ class AgentExecutor:
                     error=str(classified)[:1000],
                 )
                 if isinstance(exc, TimeoutError) or any(
-                    marker in str(exc).lower()
-                    for marker in ("timeout", "timed out")
+                    marker in str(exc).lower() for marker in ("timeout", "timed out")
                 ):
                     history[-1]["timeout_kind"] = "model"
                     history[-1]["timeout_phase"] = "planning"
@@ -2851,9 +2975,7 @@ class AgentExecutor:
                     if cancellation is not None:
                         history[-1]["cancelled_before_retry"] = True
                         if cancellation.get("timeout_kind"):
-                            history[-1]["timeout_kind"] = cancellation[
-                                "timeout_kind"
-                            ]
+                            history[-1]["timeout_kind"] = cancellation["timeout_kind"]
                         state["retry_history"] = history
                         persist_retry_state(state)
                         return cancelled_result()
@@ -2906,7 +3028,11 @@ class AgentExecutor:
         finally:
             current = getattr(self._toolkit_local, "current", None)
             if current is not None:
-                current.close()
+                runtime = agent.get("_managed_runtime") or {}
+                if runtime.get("task_context") is not None:
+                    runtime["_task_toolkit"] = current
+                else:
+                    current.close()
             self._toolkit_local.current = previous
 
     def _wire_goal_planning(
@@ -3281,7 +3407,8 @@ class AgentExecutor:
             or not _accepts("tool_requirement")
         ):
             raise FatalError(
-                f"Agent {execution_agent_cls.__name__} cannot enforce required native tools"
+                f"Agent {execution_agent_cls.__name__} cannot enforce required "
+                "native tools"
             )
         if _accepts("tool_requirement"):
             agent_kwargs["tool_requirement"] = tool_requirement
@@ -3372,6 +3499,133 @@ class AgentExecutor:
         journal = getattr(self._manager, "execution_journal", None)
         managed_controller = None
         managed_semantic = execution_agent_cls.__name__ == "OrchestratorAgent"
+        task_context = (agent.get("_managed_runtime") or {}).get("task_context")
+        if (
+            task_context is not None
+            and task_context.get("execution_attempt") is not None
+        ):
+            from openjarvis.tools._stubs import ToolExecutor
+
+            if not isinstance(tool_executor, ToolExecutor):
+                raise PermissionError(
+                    "task execution requires an authorized tool boundary"
+                )
+
+            def validate_worker() -> None:
+                task_context["heartbeat_check"]()
+                self._manager.validate_task_authority(
+                    task_context["task_id"],
+                    agent["id"],
+                    task_context["principal"],
+                    task_context["authority"],
+                    task_context["execution_attempt"],
+                    task_context.get("worker_token"),
+                    task_context.get("worker_epoch"),
+                )
+
+            tool_executor._task_authority_check = validate_worker
+            if task_context.get("controller_worker_required") is True:
+                supervisor = task_context.get("task_worker_supervisor")
+                if not callable(getattr(supervisor, "execute_tool", None)):
+                    raise PermissionError("isolated task worker is required")
+
+                def dispatch_task_tool(tool_call, params, *, timeout):
+                    from openjarvis.control.task_worker import TaskWorkerExecutionError
+
+                    if tool_call.name != "synthetic_echo":
+                        return supervisor.execute_tool(
+                            tool_call, params, timeout=timeout
+                        )
+                    if (
+                        not isinstance(params, dict)
+                        or set(params) != {"value"}
+                        or not isinstance(params["value"], str)
+                    ):
+                        raise PermissionError("synthetic tool arguments invalid")
+                    params = {"value": params["value"]}
+                    request_id = uuid.uuid4().hex
+                    deadline = min(
+                        time.time() + timeout, supervisor.binding["lease_expires_at"]
+                    )
+                    identity = (
+                        task_context["task_id"],
+                        agent["id"],
+                        task_context["principal"],
+                        task_context["authority"],
+                        task_context["execution_attempt"],
+                        task_context["worker_token"],
+                        task_context["worker_epoch"],
+                    )
+                    journal_args = {
+                        "worker_id": supervisor.binding["worker_id"],
+                        "request_id": request_id,
+                        "integrity_key": task_context["integrity_key"],
+                    }
+                    version = self._manager.prepare_task_tool_journal(
+                        *identity,
+                        **journal_args,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_call.name,
+                        arguments_sha256=arguments_sha256(params),
+                        deadline=deadline,
+                    )
+                    self._manager.transition_task_tool_journal(
+                        *identity,
+                        **journal_args,
+                        expected="PREPARED",
+                        state="DISPATCHED",
+                    )
+                    try:
+                        result = supervisor.execute_tool(
+                            tool_call,
+                            params,
+                            timeout=timeout,
+                            request_id=request_id,
+                            deadline=deadline,
+                            checkpoint_version=version,
+                        )
+                        self._manager.transition_task_tool_journal(
+                            *identity,
+                            **journal_args,
+                            expected="DISPATCHED",
+                            state="RESULT_RECORDED",
+                            result_success=result.success,
+                            result_sha256=hashlib.sha256(
+                                result.content.encode("utf-8")
+                            ).hexdigest(),
+                        )
+                        result.metadata["task_tool_journal_request_id"] = request_id
+                        return result
+                    except Exception:
+                        try:
+                            self._manager.transition_task_tool_journal(
+                                *identity,
+                                **journal_args,
+                                expected="DISPATCHED",
+                                state="UNKNOWN_OUTCOME",
+                            )
+                        except Exception:
+                            logger.warning("Task tool journal requires reconciliation")
+                        raise TaskWorkerExecutionError(
+                            "TASK_TOOL_OUTCOME_UNKNOWN", unknown_outcome=True
+                        ) from None
+
+                def checkpoint_task_tool(result):
+                    self._manager.checkpoint_task_tool_journal(
+                        task_context["task_id"],
+                        agent["id"],
+                        task_context["principal"],
+                        task_context["authority"],
+                        task_context["execution_attempt"],
+                        task_context["worker_token"],
+                        task_context["worker_epoch"],
+                        worker_id=supervisor.binding["worker_id"],
+                        request_id=result.metadata["task_tool_journal_request_id"],
+                        integrity_key=task_context["integrity_key"],
+                    )
+
+                tool_executor._task_worker_dispatch = dispatch_task_tool
+                tool_executor._task_worker_checkpointed = checkpoint_task_tool
         if tool_executor is not None and journal is not None:
             tool_executor.bind_execution_journal(
                 journal,
@@ -3398,9 +3652,7 @@ class AgentExecutor:
                         agent["id"],
                         managed_runtime,
                         tool_specs=trusted_tool_specs,
-                        authorization_check=self._authorization_check_for(
-                            agent["id"]
-                        ),
+                        authorization_check=self._authorization_check_for(agent["id"]),
                         strict_schema=True,
                     )
                     if plan_was_missing:
@@ -3490,8 +3742,8 @@ class AgentExecutor:
         from openjarvis.agents._stubs import AgentContext
 
         agent_ctx = AgentContext()
-        agent_ctx.metadata["managed_cancel_requested"] = (
-            lambda: self._manager.cancellation_state(agent["id"]) is not None
+        agent_ctx.metadata["managed_cancel_requested"] = lambda: (
+            self._manager.cancellation_state(agent["id"]) is not None
         )
         artifact_inventory = _artifact_inventory(runtime.get("tool_state") or {})
         agent_ctx.metadata["managed_artifacts"] = artifact_inventory
@@ -3654,15 +3906,11 @@ class AgentExecutor:
                         system=self._system,
                         model=model,
                         engine=getattr(engine, "engine_id", "") or "",
-                        result=(
-                            None if _shadow_error is not None else result
-                        ),
+                        result=(None if _shadow_error is not None else result),
                         error=_shadow_error,
                     )
                 except Exception:  # noqa: BLE001 - shadow never stops the tick
-                    logger.debug(
-                        "Agent %s: shadow observation skipped", agent["name"]
-                    )
+                    logger.debug("Agent %s: shadow observation skipped", agent["name"])
 
         _elapsed = time.perf_counter() - _t0
         logger.info(
@@ -3698,9 +3946,7 @@ class AgentExecutor:
             "error_message": str(error)[:2000],
             "failure_code": getattr(error, "failure_code", None),
             "retryable": bool(getattr(error, "retryable", False)),
-            "escalation_eligible": bool(
-                getattr(error, "escalation_eligible", False)
-            ),
+            "escalation_eligible": bool(getattr(error, "escalation_eligible", False)),
             "suggested_action": suggest_action(error),
             "stack_trace_summary": "".join(
                 traceback.format_exception(type(error), error, error.__traceback__)[-3:]

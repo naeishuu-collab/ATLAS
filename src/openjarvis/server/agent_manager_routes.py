@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re as _re
+import secrets
 import threading
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from openjarvis.agents.manager import AgentManager
@@ -20,6 +23,7 @@ from openjarvis.agents.tool_resolver import (
 from openjarvis.agents.tool_resolver import (
     ensure_registries_populated as _ensure_registries_populated,
 )
+from openjarvis.control.task_worker import TaskWorkerSupervisor
 from openjarvis.server.model_capabilities import is_embed_only_model
 
 try:
@@ -32,6 +36,49 @@ except ImportError:
 logger = logging.getLogger("openjarvis.server.agent_manager")
 _MEMORY_BACKEND_LOCK_SETUP = threading.Lock()
 _MCP_LOCK_SETUP = threading.Lock()
+
+
+class _TaskHeartbeat:
+    """Renew a Controller-owned task lease independently of checkpoints."""
+
+    def __init__(self, manager, binding, *, interval=60.0):
+        self._manager = manager
+        self._binding = binding
+        self._interval = interval
+        self._stop = threading.Event()
+        self._failed = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while not self._stop.wait(self._interval):
+                self._manager.renew_task_authority(*self._binding)
+        except BaseException:
+            self._failed.set()
+            logger.error("Task heartbeat failed; further execution is denied")
+        finally:
+            if not self._stop.is_set():
+                self._failed.set()
+
+    def check(self):
+        if self._stop.is_set() or self._failed.is_set() or not self._thread.is_alive():
+            raise PermissionError("task heartbeat is not running")
+
+    def close(self):
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            self._failed.set()
+
+    def finish(self):
+        self.check()
+        self.close()
+        if self._failed.is_set():
+            raise PermissionError("task heartbeat did not stop safely")
 
 
 def _managed_confirmation_kwargs(app_state: Any) -> Dict[str, Any]:
@@ -102,6 +149,7 @@ class UpdateAgentRequest(BaseModel):
 
 class CreateTaskRequest(BaseModel):
     description: str
+    required_tools: Optional[List[str]] = None
 
 
 class UpdateTaskRequest(BaseModel):
@@ -246,7 +294,8 @@ def _host_supply_for_runtime(runtime: Any) -> Any:
     )
 
     supply = load_host_supply_from_env(
-        capability_policy=getattr(runtime, "capability_policy", None))
+        capability_policy=getattr(runtime, "capability_policy", None)
+    )
     runtime.host_supply = supply
     return supply
 
@@ -1865,7 +1914,10 @@ def create_agent_manager_router(
     def recover_agent(agent_id: str):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        checkpoint = manager.recover_agent(agent_id)
+        try:
+            checkpoint = manager.recover_agent(agent_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"recovered": True, "checkpoint": checkpoint}
 
     # ── Tasks ────────────────────────────────────────────────
@@ -1878,17 +1930,423 @@ def create_agent_manager_router(
     async def create_task(agent_id: str, req: CreateTaskRequest):
         if not manager.get_agent(agent_id):
             raise HTTPException(status_code=404, detail="Agent not found")
-        return manager.create_task(agent_id, description=req.description)
+        try:
+            return manager.create_task(
+                agent_id,
+                description=req.description,
+                required_tools=req.required_tools or [],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @agents_router.post("/{agent_id}/tasks/{task_id}/run")
+    def run_task(agent_id: str, task_id: str, request: Request):
+        task = manager._get_task(task_id, agent_id=agent_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        agent = manager.get_agent(agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if agent["status"] == "archived":
+            raise HTTPException(status_code=409, detail="Agent is archived")
+
+        app_state = request.app.state
+        host_context = getattr(request.state, "host_principal_context", None)
+        principal = getattr(host_context, "principal", None)
+        authority = getattr(app_state, "host_principal_authority", None)
+        integrity_key = getattr(app_state, "task_checkpoint_integrity_key", None)
+        if (
+            not callable(getattr(authority, "accepts", None))
+            or not authority.accepts(principal)
+            or not isinstance(integrity_key, bytes)
+            or len(integrity_key) < 32
+        ):
+            raise HTTPException(
+                status_code=403, detail="authenticated host context required"
+            )
+        from openjarvis.security.principal import TestPrincipalAuthority
+
+        if (
+            isinstance(authority, TestPrincipalAuthority)
+            and getattr(app_state, "testing", False) is not True
+        ):
+            raise HTTPException(status_code=403, detail="test authority is disabled")
+
+        host_session_id = getattr(host_context, "session_id", None)
+        if host_session_id is not None and not isinstance(host_session_id, str):
+            raise HTTPException(
+                status_code=403, detail="host session context is invalid"
+            )
+        if manager.cancellation_state(agent_id) is not None:
+            raise HTTPException(status_code=409, detail="agent cancellation is active")
+
+        started = None
+        heartbeat = None
+        task_worker = None
+        task_worker_closed = False
+        try:
+            worker_token = secrets.token_urlsafe(32)
+            started = manager.start_task(
+                task_id,
+                agent_id,
+                principal.principal_id,
+                host_session_id,
+                expected_state_version=task["state_version"],
+                worker_token=worker_token,
+            )
+            heartbeat = _TaskHeartbeat(
+                manager,
+                (
+                    task_id,
+                    agent_id,
+                    principal,
+                    authority,
+                    started["execution_attempt"],
+                    worker_token,
+                    1,
+                ),
+            )
+            heartbeat.start()
+            heartbeat.check()
+            manager.initialize_task_tool_journal(
+                task_id,
+                agent_id,
+                principal,
+                authority,
+                started["execution_attempt"],
+                worker_token,
+                1,
+                integrity_key=integrity_key,
+            )
+            task_authority = manager.task_authority_binding(
+                task_id,
+                agent_id,
+                principal,
+                authority,
+                started["execution_attempt"],
+                worker_token,
+                1,
+            )
+
+            def validate_task_worker_authority() -> None:
+                heartbeat.check()
+                manager.validate_task_authority(
+                    task_id,
+                    agent_id,
+                    principal,
+                    authority,
+                    started["execution_attempt"],
+                    worker_token,
+                    task_authority["epoch"],
+                )
+
+            supervisor_factory = getattr(
+                app_state, "task_worker_supervisor_factory", None
+            )
+            allow_test_fallback = (
+                supervisor_factory is None
+                and isinstance(authority, TestPrincipalAuthority)
+                and getattr(app_state, "testing", False) is True
+            )
+            if supervisor_factory is None:
+                if not allow_test_fallback:
+                    raise PermissionError("host supervisor factory required")
+                supervisor_factory = TaskWorkerSupervisor
+            if not callable(supervisor_factory):
+                raise PermissionError("host supervisor factory is invalid")
+            task_worker = supervisor_factory(
+                {
+                    "worker_id": uuid.uuid4().hex,
+                    "supervisor_id": uuid.uuid4().hex,
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "principal_id": principal.principal_id,
+                    "attempt": started["execution_attempt"],
+                    "owner_hash": task_authority["owner_hash"],
+                    "epoch": task_authority["epoch"],
+                    "checkpoint_version": started["checkpoint_version"],
+                    "lease_expires_at": task_authority["lease_expires_at"],
+                },
+                validate_authority=validate_task_worker_authority,
+            )
+            if not allow_test_fallback:
+                from openjarvis.control.host_supervisor_broker import (
+                    HostSupervisorClient,
+                )
+
+                if not isinstance(task_worker, HostSupervisorClient):
+                    raise PermissionError("host supervisor client required")
+            task_worker.start()
+            manager.send_message(agent_id, started["description"], mode="immediate")
+            from openjarvis.agents.executor import AgentExecutor
+
+            executor = AgentExecutor(
+                manager=manager,
+                event_bus=_get_runtime_event_bus(app_state),
+                trace_store=getattr(app_state, "trace_store", None),
+            )
+            system = _make_lightweight_system(
+                getattr(app_state, "engine", None),
+                getattr(app_state, "model", ""),
+                getattr(app_state, "config", None),
+                app_state,
+            )
+            executor.set_system(system)
+            task_context = {
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "principal": principal,
+                "authority": authority,
+                "integrity_key": integrity_key,
+                "host_session_id": host_session_id,
+                "execution_attempt": started["execution_attempt"],
+                "worker_token": worker_token,
+                "worker_epoch": 1,
+                "heartbeat_check": heartbeat.check,
+                "state_version": started["state_version"],
+                "checkpoint_id": started["checkpoint_id"],
+                "checkpoint_version": started["checkpoint_version"],
+                "cancellation_state": started["cancellation_state"],
+                "revocation_state": started["revocation_state"],
+                "controller_worker_required": True,
+                "task_worker_supervisor": task_worker,
+            }
+            result = executor.execute_tick(agent_id, task_context=task_context)
+            if result is None:
+                raise PermissionError("executor did not produce a verified result")
+            evidence = [
+                {
+                    "tool_name": getattr(item, "tool_name", None),
+                    "success": getattr(item, "success", None) is True,
+                    "result_sha256": hashlib.sha256(
+                        str(getattr(item, "content", "")).encode("utf-8")
+                    ).hexdigest(),
+                }
+                for item in result.tool_results
+            ]
+            refreshed = manager._get_task(task_id, agent_id=agent_id)
+            if refreshed is None:
+                raise PermissionError("task disappeared during execution")
+            task_worker.close()
+            task_worker_closed = True
+            heartbeat.finish()
+            completed = manager.complete_task(
+                task_id,
+                agent_id,
+                principal,
+                authority,
+                execution_attempt=started["execution_attempt"],
+                expected_state_version=started["state_version"],
+                checkpoint_id=refreshed["checkpoint_id"],
+                checkpoint_version=refreshed["checkpoint_version"],
+                integrity_key=integrity_key,
+                worker_token=worker_token,
+                worker_epoch=1,
+                result_text=result.content,
+                result_metadata=result.metadata,
+                tool_evidence=evidence,
+                worker_exit_evidence=task_worker.evidence,
+                verify_worker_exit_evidence=getattr(
+                    task_worker, "verify_exit_evidence", None
+                ),
+            )
+            return {
+                "task": completed,
+                "result": result.content,
+                "checkpoint_id": completed["checkpoint_id"],
+                "checkpoint_version": completed["checkpoint_version"],
+            }
+        except HTTPException:
+            raise
+        except PermissionError as exc:
+            if started is not None:
+                manager.fail_task(
+                    task_id,
+                    agent_id,
+                    started["execution_attempt"],
+                    started["state_version"],
+                    status=(
+                        "cancelled"
+                        if manager.cancellation_state(agent_id) is not None
+                        else "failed"
+                    ),
+                )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            if started is not None:
+                manager.fail_task(
+                    task_id,
+                    agent_id,
+                    started["execution_attempt"],
+                    started["state_version"],
+                )
+            logger.exception("Controller task execution failed for %s", task_id)
+            raise HTTPException(
+                status_code=500, detail="task execution failed"
+            ) from exc
+        finally:
+            if task_worker is not None and not task_worker_closed:
+                try:
+                    task_worker.close()
+                except Exception:
+                    logger.error("Task worker cleanup failed for %s", task_id)
+            if heartbeat is not None:
+                heartbeat.close()
+            release = getattr(task_worker, "release_exit_evidence", None)
+            if callable(release):
+                release()
+
+    def _verified_host_worker_exit(agent_id: str, task_id: str, request: Request):
+        from openjarvis.control.host_task_supervisor import verify_signed_exit_record
+
+        app_state = request.app.state
+        principal = getattr(
+            getattr(request.state, "host_principal_context", None), "principal", None
+        )
+        authority = getattr(app_state, "host_principal_authority", None)
+        integrity_key = getattr(app_state, "task_checkpoint_integrity_key", None)
+        observer = getattr(app_state, "host_supervisor_observer", None)
+        if callable(observer):
+            try:
+                observer = observer(task_id, agent_id, principal)
+            except Exception:
+                observer = None
+        if (
+            not callable(getattr(authority, "accepts", None))
+            or not authority.accepts(principal)
+            or not isinstance(integrity_key, bytes)
+            or len(integrity_key) < 32
+            or not isinstance(observer, dict)
+            or not callable(observer.get("fetch"))
+            or not isinstance(observer.get("binding"), dict)
+            or not isinstance(observer.get("verification_key"), bytes)
+        ):
+            raise HTTPException(status_code=403, detail="host observer required")
+        from openjarvis.security.principal import TestPrincipalAuthority
+
+        if (
+            isinstance(authority, TestPrincipalAuthority)
+            and getattr(app_state, "testing", False) is not True
+        ):
+            raise HTTPException(status_code=403, detail="test authority is disabled")
+        try:
+            binding = observer["binding"]
+            task = manager._get_task(task_id, agent_id=agent_id)
+            if (
+                task is None
+                or task["principal_id"] != principal.principal_id
+                or binding.get("task_id") != task_id
+                or binding.get("agent_id") != agent_id
+                or binding.get("principal_id") != principal.principal_id
+                or binding.get("attempt") != task["execution_attempt"]
+            ):
+                raise PermissionError("host observer binding mismatch")
+            rows = manager.read_task_tool_journal(
+                task_id, agent_id, principal, authority, integrity_key=integrity_key
+            )
+            if not rows or any(
+                row["worker_id"] != binding.get("worker_id")
+                or row["epoch"] != binding.get("epoch")
+                or row["owner_hash"] != binding.get("owner_hash")
+                for row in rows
+            ):
+                raise PermissionError("host observer journal mismatch")
+            checkpoint = manager.get_bound_task_checkpoint(
+                task_id, agent_id, principal, authority, integrity_key=integrity_key
+            )
+            record = observer["fetch"]()
+            durable = manager.read_host_worker_exit(
+                principal,
+                authority,
+                binding,
+                observer["verification_key"],
+                integrity_key=integrity_key,
+            )
+            if (
+                record != durable
+                or not verify_signed_exit_record(
+                    record, observer["verification_key"], binding
+                )
+                or not authority.accepts(principal)
+            ):
+                raise PermissionError("host supervisor exit evidence invalid")
+            return {
+                "principal": principal,
+                "authority": authority,
+                "integrity_key": integrity_key,
+                "observer": observer,
+                "binding": binding,
+                "task": task,
+                "rows": rows,
+                "checkpoint": checkpoint,
+                "exit_record": record,
+            }
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="host evidence unavailable"
+            ) from None
+
+    @agents_router.get("/{agent_id}/tasks/{task_id}/worker-exit-evidence")
+    def worker_exit_evidence(agent_id: str, task_id: str, request: Request):
+        """Read verified exit evidence without transferring authority or resuming."""
+        verified = _verified_host_worker_exit(agent_id, task_id, request)
+        return {
+            "exit_record": verified["exit_record"],
+            "task_status": verified["task"]["status"],
+            "checkpoint_version": verified["checkpoint"]["task_binding_version"],
+            "journal_states": [row["recovery_state"] for row in verified["rows"]],
+        }
+
+    @agents_router.post("/{agent_id}/tasks/{task_id}/epoch-fence")
+    def fence_task_epoch(agent_id: str, task_id: str, request: Request):
+        """Advance SQLite Authority only after verified worker and Job exit."""
+        verified = _verified_host_worker_exit(agent_id, task_id, request)
+        try:
+            epoch = manager.fence_task_authority_after_worker_exit(
+                verified["principal"],
+                verified["authority"],
+                verified["binding"],
+                verified["exit_record"],
+                verified["observer"]["verification_key"],
+                integrity_key=verified["integrity_key"],
+            )
+            return {
+                "previous_epoch": verified["binding"]["epoch"],
+                "epoch": epoch,
+                "state": "FENCED",
+                "task_status": verified["task"]["status"],
+                "checkpoint_version": verified["checkpoint"]["task_binding_version"],
+                "journal_states": [row["recovery_state"] for row in verified["rows"]],
+            }
+        except Exception:
+            raise HTTPException(
+                status_code=409, detail="task epoch fence unavailable"
+            ) from None
 
     @agents_router.get("/{agent_id}/tasks/{task_id}")
     async def get_task(agent_id: str, task_id: str):
-        task = manager._get_task(task_id)
+        task = manager._get_task(task_id, agent_id=agent_id)
         if not task:
             raise HTTPException(status_code=404, detail="Task not found")
         return task
 
     @agents_router.patch("/{agent_id}/tasks/{task_id}")
     async def update_task(agent_id: str, task_id: str, req: UpdateTaskRequest):
+        current = manager._get_task(task_id, agent_id=agent_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if current["execution_attempt"] is not None and any(
+            value is not None
+            for value in (req.description, req.status, req.progress, req.findings)
+        ):
+            raise HTTPException(
+                status_code=409, detail="Controller-owned task identity is locked"
+            )
+        if req.status is not None and req.status.lower() not in {"pending", "running"}:
+            raise HTTPException(
+                status_code=409,
+                detail="terminal task states require Controller verification",
+            )
         kwargs: Dict[str, Any] = {}
         if req.description is not None:
             kwargs["description"] = req.description
@@ -1898,11 +2356,21 @@ def create_agent_manager_router(
             kwargs["progress"] = req.progress
         if req.findings is not None:
             kwargs["findings"] = req.findings
-        return manager.update_task(task_id, **kwargs)
+        task = manager.update_task(
+            task_id, agent_id=agent_id, unclaimed_only=True, **kwargs
+        )
+        if task is None:
+            raise HTTPException(status_code=409, detail="Task changed during update")
+        return task
 
     @agents_router.delete("/{agent_id}/tasks/{task_id}")
     async def delete_task(agent_id: str, task_id: str):
-        manager.delete_task(task_id)
+        if not manager.delete_task(task_id, agent_id=agent_id, unclaimed_only=True):
+            if manager._get_task(task_id, agent_id=agent_id) is not None:
+                raise HTTPException(
+                    status_code=409, detail="Controller-owned task is locked"
+                )
+            raise HTTPException(status_code=404, detail="Task not found")
         return {"status": "deleted"}
 
     # ── Channel bindings ─────────────────────────────────────
