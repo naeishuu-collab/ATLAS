@@ -101,7 +101,26 @@ jobs:
         run: |
           uv run ruff check src tests 2>&1 | Tee-Object -FilePath validation-evidence\ruff.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          uv run pytest tests\control\test_sprint17_job_recovery.py tests\control\test_sprint15_job_exit.py tests\agents\test_sprint15_task_authority.py tests\agents\test_task_checkpoint_binding.py tests\control\test_sprint15_task_worker_ipc.py tests\control\test_host_supervisor_sessions.py tests\control\test_host_supervisor_broker.py tests\control\test_host_task_supervisor.py tests\control\test_windows_named_pipe.py tests\integration\test_host_bootstrap_ipc.py tests\integration\test_host_supervisor_controller.py tests\integration\test_host_supervisor_crash_e2e.py tests\integration\test_sprint15_host_lease_recheck.py tests\integration\test_phase1_sprint15_controller_worker_e2e.py 2>&1 | Tee-Object -FilePath validation-evidence\python-focused.log
+          uv run pytest `
+            tests\control\test_sprint17_job_recovery.py `
+            tests\agents\test_host_dispatch_claim.py `
+            tests\agents\test_sprint15_heartbeat.py `
+            tests\agents\test_sprint15_task_authority.py `
+            tests\agents\test_sprint15_task_tick_lock.py `
+            tests\agents\test_sprint15_task_tool_journal.py `
+            tests\agents\test_task_checkpoint_binding.py `
+            tests\control\test_host_supervisor_broker.py `
+            tests\control\test_host_task_supervisor.py `
+            tests\control\test_sprint15_task_worker_ipc.py `
+            tests\control\test_windows_named_pipe.py `
+            tests\integration\test_host_bootstrap_ipc.py `
+            tests\integration\test_host_supervisor_controller.py `
+            tests\integration\test_host_supervisor_crash_e2e.py `
+            tests\integration\test_phase1_sprint13_controller_completion.py `
+            tests\integration\test_phase1_sprint15_controller_worker_e2e.py `
+            tests\security\test_host_principal.py `
+            tests\server\test_agent_manager_routes.py `
+            tests\server\test_sprint14_task_lock.py 2>&1 | Tee-Object -FilePath validation-evidence\python-focused.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Rust formatting, tests, and Tauri build
