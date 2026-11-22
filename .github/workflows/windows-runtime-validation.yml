@@ -1,0 +1,479 @@
+name: Windows Runtime Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Allowed development branch containing the source commit
+        required: true
+        type: choice
+        options:
+          - codex/atlas-sprint17-19-integration
+          - codex/atlas-sprint21-runtime-recovery
+          - codex/atlas-sprint22-windows-validation
+          - codex/atlas-sprint23-native-runtime
+      source_sha:
+        description: Exact lowercase 40-character commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-validation:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Validate source ref and ancestry before checkout
+        id: source
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $log = Join-Path $evidence 'source-preflight.log'
+          "Started UTC: $([DateTime]::UtcNow.ToString('o'))" | Set-Content -LiteralPath $log -Encoding utf8
+          "Requested source: repository=$($env:REPOSITORY) branch=$($env:SOURCE_BRANCH) sha=$($env:SOURCE_SHA)" |
+            Add-Content -LiteralPath $log
+          try {
+            $allowed = @('codex/atlas-sprint17-19-integration', 'codex/atlas-sprint21-runtime-recovery',
+              'codex/atlas-sprint22-windows-validation', 'codex/atlas-sprint23-native-runtime')
+            if ($env:WORKFLOW_REF -cne 'refs/heads/opencode/cloud-privacy') { throw 'Dispatch must use the default workflow ref.' }
+            if ($env:SOURCE_BRANCH -cnotin $allowed) { throw 'source_branch is not an explicitly allowed development branch.' }
+            if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'source_sha must be exactly 40 lowercase hexadecimal characters.' }
+            if ($env:REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Unexpected repository slug.' }
+
+            $verifyRepo = Join-Path $env:RUNNER_TEMP 'source-reachability.git'
+            if (Test-Path -LiteralPath $verifyRepo) { throw 'Temporary reachability repository already exists.' }
+            $remote = "https://github.com/$($env:REPOSITORY).git"
+            $refspec = "+refs/heads/$($env:SOURCE_BRANCH):refs/remotes/allowed/source"
+            & git init --bare $verifyRepo 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "git init failed ($code)." }
+            & git -C $verifyRepo fetch --no-tags --filter=blob:none $remote $refspec 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Approved branch fetch failed ($code)." }
+            & git -C $verifyRepo cat-file -e "$($env:SOURCE_SHA)^{commit}" 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw 'source_sha is not a commit in the fetched approved branch history.' }
+            $tipLines = & git -C $verifyRepo rev-parse refs/remotes/allowed/source 2>&1
+            $code = $LASTEXITCODE
+            $tip = ($tipLines | Out-String).Trim()
+            $tipLines | Add-Content -LiteralPath $log
+            if ($code -ne 0 -or $tip -cnotmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the fetched branch tip.' }
+            & git -C $verifyRepo merge-base --is-ancestor $env:SOURCE_SHA refs/remotes/allowed/source 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "source_sha is not reachable from the selected branch tip (git exit $code)." }
+
+            [ordered]@{
+              repository = $env:REPOSITORY
+              workflow_ref = $env:WORKFLOW_REF
+              workflow_sha = $env:WORKFLOW_SHA
+              workflow_run_id = $env:RUN_ID
+              workflow_run_attempt = $env:RUN_ATTEMPT
+              source_branch = $env:SOURCE_BRANCH
+              source_sha = $env:SOURCE_SHA
+              fetched_branch_tip_sha = $tip
+              source_commit_reachable_from_allowed_branch = $true
+              checked_at_utc = [DateTime]::UtcNow.ToString('o')
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'source-binding.json') -Encoding utf8
+            'Source commit ancestry verified before checkout.' | Add-Content -LiteralPath $log
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath $log
+            throw
+          }
+
+      - name: Checkout verified source SHA
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13.18'
+
+      - name: Set up pinned Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.5'
+
+      - name: Set up pinned uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: '0.13.8'
+          enable-cache: false
+
+      - name: Set up pinned Rust and rustfmt
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # fixed action commit
+        with:
+          toolchain: '1.89.0'
+          components: rustfmt
+
+      - name: Verify checkout and pinned tools
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUSTUP_TOOLCHAIN: '1.89.0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          $log = Join-Path $evidence 'toolchain-and-checkout.log'
+          try {
+            $actual = (& git rev-parse HEAD 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "git rev-parse failed ($code)." }
+            if ($actual -cne $env:EXPECTED_SOURCE_SHA) { throw "Checked out $actual instead of requested SHA." }
+            $binding = Get-Content -Raw (Join-Path $evidence 'source-binding.json') | ConvertFrom-Json
+            if ($binding.source_sha -cne $actual -or $binding.source_branch -cne $env:SOURCE_BRANCH -or
+                $binding.workflow_ref -cne $env:WORKFLOW_REF -or $binding.workflow_sha -cne $env:WORKFLOW_SHA -or
+                $binding.source_commit_reachable_from_allowed_branch -ne $true) { throw 'Checkout did not match pre-checkout ancestry proof.' }
+            $dirty = (& git status --porcelain=v1 --untracked-files=no 2>&1 | Out-String).Trim()
+            $code = $LASTEXITCODE
+            if ($code -ne 0 -or $dirty) { throw 'Checkout was not clean before validation.' }
+
+            npm install --global npm@11.19.0 2>&1 | Tee-Object -FilePath $log -Append
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "npm pin failed ($code)." }
+            function ToolVersion([string]$exe, [string[]]$arguments) {
+              $out = & $exe @arguments 2>&1
+              $exitCode = $LASTEXITCODE
+              $out | Add-Content -LiteralPath $log
+              if ($exitCode -ne 0) { throw "$exe version query failed ($exitCode)." }
+              return (($out | Out-String).Trim())
+            }
+            $python = ToolVersion 'python' @('-c', 'import sys; print(".".join(map(str, sys.version_info[:3])))')
+            $node = ToolVersion 'node' @('--version')
+            $npm = ToolVersion 'npm' @('--version')
+            $uv = ToolVersion 'uv' @('--version')
+            $rustc = ToolVersion 'rustc' @('--version')
+            $cargo = ToolVersion 'cargo' @('--version')
+            if ($python -cne '3.13.18' -or $node -cne 'v22.23.5' -or $npm -cne '11.19.0' -or
+                $uv -notmatch '^uv 0\.13\.8(?:\s|$)' -or $rustc -notmatch '^rustc 1\.89\.0(?:\s|$)' -or
+                $cargo -notmatch '^cargo 1\.89\.0(?:\s|$)') { throw 'A pinned tool version did not match.' }
+            $os = Get-CimInstance Win32_OperatingSystem
+            [ordered]@{
+              source_sha = $actual; checkout_verified = $true
+              source_branch = $env:SOURCE_BRANCH; branch_tip_sha = $binding.fetched_branch_tip_sha
+              workflow_ref = $env:WORKFLOW_REF; workflow_sha = $env:WORKFLOW_SHA
+              runner_image = $env:ImageOS; runner_os = $env:RUNNER_OS; runner_arch = $env:RUNNER_ARCH
+              windows_caption = $os.Caption; windows_version = $os.Version
+              python = $python; node = $node; npm = $npm; uv = $uv; rustc = $rustc; cargo = $cargo
+              recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+            } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $evidence 'provenance.json') -Encoding utf8
+            'Checkout and pinned tool versions verified.' | Add-Content -LiteralPath $log
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath $log
+            throw
+          }
+
+      - name: Initialize and verify MSVC x64 toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          $log = Join-Path $evidence 'msvc-setup.log'
+          try {
+            $pf86 = [Environment]::GetFolderPath('ProgramFilesX86')
+            $vswhere = Join-Path $pf86 'Microsoft Visual Studio\Installer\vswhere.exe'
+            if (!(Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe is missing.' }
+            $installs = & $vswhere -all -products '*' -property installationPath 2>&1
+            $code = $LASTEXITCODE
+            $installs | Add-Content -LiteralPath $log
+            if ($code -ne 0) { throw "vswhere failed ($code)." }
+            $install = $null
+            foreach ($candidate in $installs) {
+              $candidate = "$candidate".Trim()
+              if ($candidate -and (Test-Path (Join-Path $candidate 'Common7\Tools\VsDevCmd.bat')) -and
+                  (Test-Path (Join-Path $candidate 'VC\Tools\MSVC'))) { $install = $candidate; break }
+            }
+            if (!$install) { throw 'No Visual Studio installation with VsDevCmd and MSVC tools was found.' }
+            $devCmd = Join-Path $install 'Common7\Tools\VsDevCmd.bat'
+            $cmdLine = 'call "' + $devCmd + '" -no_logo -arch=amd64 -host_arch=amd64 && set'
+            $vars = & $env:ComSpec /d /s /c $cmdLine 2>&1
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "VsDevCmd failed ($code)." }
+            $msvcEnvironment = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'CL', '_CL_', 'VCINSTALLDIR', 'VCToolsInstallDir',
+              'VCToolsVersion', 'VCToolsRedistDir', 'VSINSTALLDIR', 'VisualStudioVersion', 'VSCMD_ARG_TGT_ARCH',
+              'VSCMD_ARG_HOST_ARCH', 'VSCMD_VER', 'WindowsSdkDir', 'WindowsSDKVersion', 'UniversalCRTSdkDir',
+              'UCRTVersion', 'WindowsLibPath') | ForEach-Object { [void]$msvcEnvironment.Add($_) }
+            foreach ($line in $vars) {
+              $i = "$line".IndexOf('=')
+              if ($i -le 0) { continue }
+              $name = "$line".Substring(0, $i)
+              $value = "$line".Substring($i + 1)
+              if (!$msvcEnvironment.Contains($name)) { continue }
+              Set-Item "Env:$name" $value
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value "$name=$value"
+            }
+            if (!$env:VCToolsVersion -or $env:VSCMD_ARG_TGT_ARCH -cne 'x64' -or
+                $env:VSCMD_ARG_HOST_ARCH -cne 'x64' -or !$env:WindowsSDKVersion -or !$env:WindowsSdkDir) {
+              throw 'MSVC x64 or Windows SDK environment was not configured.'
+            }
+            $sdk = $env:WindowsSDKVersion.TrimEnd('\')
+            $header = Join-Path $env:WindowsSdkDir "Include\$sdk\um\Windows.h"
+            if (!(Test-Path -LiteralPath $header)) { throw "Windows SDK header missing: $header." }
+            $bin = Join-Path $install "VC\Tools\MSVC\$($env:VCToolsVersion)\bin\Hostx64\x64"
+            $cl = Get-Command cl.exe -CommandType Application -ErrorAction Stop
+            $linker = Get-Command link.exe -CommandType Application -ErrorAction Stop
+            if ($cl.Source -ine (Join-Path $bin 'cl.exe') -or $linker.Source -ine (Join-Path $bin 'link.exe')) {
+              throw 'cl.exe or link.exe resolved outside the selected MSVC tool directory.'
+            }
+            "MSVC $($env:VCToolsVersion), SDK $sdk, cl=$($cl.Source), link=$($linker.Source)" | Set-Content -LiteralPath $log -Encoding utf8
+            & cl.exe /Bv 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'msvc-compiler.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "cl.exe /Bv failed ($code)." }
+            & link.exe /? 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'msvc-linker.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "link.exe /? failed ($code)." }
+            [ordered]@{
+              visual_studio_installation = $install; msvc_version = $env:VCToolsVersion
+              host_architecture = $env:VSCMD_ARG_HOST_ARCH; target_architecture = $env:VSCMD_ARG_TGT_ARCH
+              cl_path = $cl.Source; link_path = $linker.Source; windows_sdk = $sdk
+              windows_sdk_header_verified = $header
+            } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $evidence 'msvc-provenance.json') -Encoding utf8
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath $log
+            throw
+          }
+
+      - name: Frontend tests, production dependency audit, and Tauri assets
+        working-directory: frontend
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          try {
+            npm ci 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'npm-ci.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "npm ci failed ($code)." }
+            npm test 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'frontend-vitest.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Frontend tests failed ($code)." }
+            npm run build:tauri 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'frontend-build.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0 -or !(Test-Path -LiteralPath 'dist\index.html')) { throw 'Tauri frontend build failed or did not produce dist/index.html.' }
+
+            $auditLevel = 'critical'
+            if ($env:SOURCE_BRANCH -ceq 'codex/atlas-sprint23-native-runtime') { $auditLevel = 'high' }
+            $auditPath = Join-Path $evidence 'npm-audit-production.json'
+            $auditStderr = Join-Path $evidence 'npm-audit-stderr.log'
+            npm audit --omit=dev --audit-level=$auditLevel --json 2> $auditStderr > $auditPath
+            $code = $LASTEXITCODE
+            if (!(Test-Path -LiteralPath $auditPath)) { throw "npm audit report missing (exit $code)." }
+            $audit = Get-Content -Raw -LiteralPath $auditPath | ConvertFrom-Json -ErrorAction Stop
+            if ($audit.error -or $null -eq $audit.metadata.vulnerabilities) { throw 'npm audit did not return valid vulnerability metadata.' }
+            $counts = $audit.metadata.vulnerabilities
+            if (!$counts.PSObject.Properties['critical'] -or !$counts.PSObject.Properties['high'] -or
+                $null -eq $audit.metadata.dependencies -or
+                [int]$audit.metadata.dependencies.total -le 0) {
+              throw 'npm audit report omitted severity counts or scanned no production dependencies.'
+            }
+            $blockingCount = [int]$counts.$auditLevel
+            if ($auditLevel -ceq 'high') { $blockingCount += [int]$counts.critical }
+            if ($code -ne 0 -or $blockingCount -gt 0) {
+              throw "npm audit failed at $auditLevel threshold; exit=$code counts=$($audit.metadata.vulnerabilities | ConvertTo-Json -Compress)."
+            }
+            "Production audit threshold=$auditLevel counts=$($audit.metadata.vulnerabilities | ConvertTo-Json -Compress)" |
+              Set-Content -LiteralPath (Join-Path $evidence 'npm-audit-summary.log') -Encoding utf8
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath (Join-Path $evidence 'frontend-validation-error.log')
+            throw
+          }
+
+      - name: Build and import locked native Python extension
+        env:
+          RUSTUP_TOOLCHAIN: '1.89.0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          try {
+            uv sync --locked --extra dev --extra server --group desktop-native 2>&1 |
+              Tee-Object -FilePath (Join-Path $evidence 'uv-locked-native-build.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Locked uv sync/native build failed ($code)." }
+            uv run python -c 'import importlib.machinery, pathlib, openjarvis_rust; p = pathlib.Path(openjarvis_rust.__file__).resolve(); assert any(str(p).endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES), f"not a native extension: {p}"; print(p)' 2>&1 |
+              Tee-Object -FilePath (Join-Path $evidence 'native-extension-import.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Native extension import failed ($code)." }
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath (Join-Path $evidence 'native-extension-error.log')
+            throw
+          }
+
+      - name: Python lint and focused lifecycle/security tests
+        env:
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          try {
+            $tests = @('tests\control\test_sprint17_job_recovery.py', 'tests\security\test_authority_lifecycle.py',
+              'tests\security\test_host_authority_boundary.py', 'tests\security\test_safety_authority_regression.py')
+            if ($env:SOURCE_BRANCH -cne 'codex/atlas-sprint17-19-integration') {
+              $tests += @('tests\agents\test_host_dispatch_claim.py', 'tests\agents\test_sprint15_heartbeat.py',
+                'tests\agents\test_sprint15_task_authority.py', 'tests\agents\test_sprint15_task_tick_lock.py',
+                'tests\agents\test_sprint15_task_tool_journal.py', 'tests\agents\test_task_checkpoint_binding.py',
+                'tests\control\test_host_supervisor_broker.py', 'tests\control\test_host_task_supervisor.py',
+                'tests\control\test_sprint15_task_worker_ipc.py', 'tests\control\test_windows_named_pipe.py',
+                'tests\integration\test_host_bootstrap_ipc.py', 'tests\integration\test_host_supervisor_controller.py',
+                'tests\integration\test_host_supervisor_crash_e2e.py', 'tests\integration\test_phase1_sprint13_controller_completion.py',
+                'tests\integration\test_phase1_sprint15_controller_worker_e2e.py', 'tests\security\test_host_principal.py',
+                'tests\server\test_agent_manager_routes.py', 'tests\server\test_sprint14_task_lock.py')
+            }
+            if ($env:SOURCE_BRANCH -ceq 'codex/atlas-sprint23-native-runtime') {
+              $tests += @('tests\control\test_sprint15_job_exit.py', 'tests\security\test_principal.py')
+            }
+            foreach ($test in $tests) {
+              if (!(Test-Path -LiteralPath $test)) { throw "Focused test missing on selected branch: $test." }
+            }
+            $lintFiles = @('src\openjarvis\agents\manager.py', 'src\openjarvis\control\host_task_supervisor.py',
+              'src\openjarvis\server\agent_manager_routes.py') + $tests
+            uv run ruff check @lintFiles 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'ruff-check.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Ruff check failed ($code)." }
+            $formatFiles = @('src\openjarvis\agents\manager.py', 'src\openjarvis\control\host_task_supervisor.py',
+              'src\openjarvis\server\agent_manager_routes.py')
+            if ($env:SOURCE_BRANCH -ceq 'codex/atlas-sprint23-native-runtime') {
+              $formatFiles += @('tests\agents\test_task_checkpoint_binding.py',
+                'tests\control\test_host_task_supervisor.py', 'tests\control\test_sprint15_job_exit.py',
+                'tests\security\test_principal.py', 'tests\server\test_agent_manager_routes.py')
+            }
+            uv run ruff format --check @formatFiles 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'ruff-format.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Ruff format check failed ($code)." }
+            "Selected $($tests.Count) focused Python files for $($env:SOURCE_BRANCH)." |
+              Set-Content -LiteralPath (Join-Path $evidence 'python-test-selection.log') -Encoding utf8
+            uv run pytest @tests 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'python-focused-tests.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Focused Python tests failed ($code)." }
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath (Join-Path $evidence 'python-validation-error.log')
+            throw
+          }
+
+      - name: Locked Rust workspace and Tauri tests
+        env:
+          RUSTUP_TOOLCHAIN: '1.89.0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          $failures = [System.Collections.Generic.List[string]]::new()
+          function Invoke-RustCheck([string]$name, [scriptblock]$command, [string]$logPath,
+            [System.Collections.Generic.List[string]]$failureList) {
+            try {
+              & $command 2>&1 | Tee-Object -FilePath $logPath
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) { [void]$failureList.Add("$name failed ($exitCode).") }
+            }
+            catch {
+              "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath $logPath
+              [void]$failureList.Add("$name threw: $($_.Exception.Message)")
+            }
+          }
+          Invoke-RustCheck 'Rust workspace rustfmt' { cargo fmt --manifest-path rust/Cargo.toml --all -- --check } (Join-Path $evidence 'rustfmt-workspace.log') $failures
+          Invoke-RustCheck 'Rust workspace tests' { cargo test --locked --manifest-path rust/Cargo.toml --workspace } (Join-Path $evidence 'rust-workspace-tests.log') $failures
+          Invoke-RustCheck 'Tauri rustfmt' { cargo fmt --manifest-path frontend/src-tauri/Cargo.toml -- --check } (Join-Path $evidence 'tauri-rustfmt.log') $failures
+          Invoke-RustCheck 'Tauri Rust tests' { cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml } (Join-Path $evidence 'tauri-rust-tests.log') $failures
+          if ($failures.Count -gt 0) {
+            $failures | Set-Content -LiteralPath (Join-Path $evidence 'rust-validation-failures.log') -Encoding utf8
+            throw "Rust validation checks failed: $($failures -join ' ')"
+          }
+          'All four Rust format/test commands passed.' |
+            Set-Content -LiteralPath (Join-Path $evidence 'rust-validation-summary.log') -Encoding utf8
+
+      - name: Build Tauri executable without bundling or signing
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        working-directory: frontend
+        env:
+          RUSTUP_TOOLCHAIN: '1.89.0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          try {
+            npm run tauri -- build --no-bundle 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'tauri-build.log')
+            $code = $LASTEXITCODE
+            if ($code -ne 0) { throw "Tauri CLI build failed ($code)." }
+            $out = Join-Path $env:GITHUB_WORKSPACE 'frontend\src-tauri\target\release'
+            $exe = Join-Path $out 'openjarvis-desktop.exe'
+            if (!(Test-Path -LiteralPath $exe)) { throw 'Tauri build returned success but openjarvis-desktop.exe is missing.' }
+            "Verified Tauri executable: $exe" | Set-Content -LiteralPath (Join-Path $evidence 'tauri-build-output.log') -Encoding utf8
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath (Join-Path $evidence 'tauri-build-error.log')
+            throw
+          }
+
+      - name: Verify lockfiles and hash provenance/logs
+        if: ${{ always() }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-runtime-validation-evidence'
+          $lockLog = Join-Path $evidence 'lockfile-verification.log'
+          try {
+            if ('${{ steps.checkout.outcome }}' -eq 'success') {
+              $locks = @('uv.lock', 'frontend\package-lock.json', 'frontend\src-tauri\Cargo.lock',
+                'rust\Cargo.lock', 'rust\crates\openjarvis-python\uv.lock')
+              foreach ($lock in $locks) {
+                if (!(Test-Path -LiteralPath $lock)) { throw "Expected lockfile missing: $lock." }
+              }
+              & git diff --exit-code HEAD -- @locks 2>&1 | Tee-Object -FilePath $lockLog
+              $code = $LASTEXITCODE
+              if ($code -ne 0) { throw "Tracked lockfile changes found ($code)." }
+              'All expected lockfiles are unchanged.' | Add-Content -LiteralPath $lockLog
+            } else {
+              'Checkout did not complete; lockfile check was not applicable.' | Set-Content -LiteralPath $lockLog -Encoding utf8
+            }
+
+            $manifest = Join-Path $evidence 'sha256-manifest.json'
+            $hashLog = Join-Path $evidence 'sha256-manifest-generation.log'
+            'Generating manifest.' | Set-Content -LiteralPath $hashLog -Encoding utf8
+            $files = @(Get-ChildItem -LiteralPath $evidence -File -Recurse |
+              Where-Object { $_.FullName -ne $manifest } | Sort-Object FullName | ForEach-Object {
+                [ordered]@{ path = [IO.Path]::GetRelativePath($evidence, $_.FullName).Replace('\', '/')
+                  bytes = $_.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant() }
+              })
+            if ($files.Count -eq 0) { throw 'No provenance or logs were created.' }
+            [ordered]@{ algorithm = 'SHA-256'; manifest_excludes_itself = $true; files = $files
+              generated_at_utc = [DateTime]::UtcNow.ToString('o') } |
+              ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest -Encoding utf8
+          }
+          catch {
+            "ERROR: $($_.Exception.Message)" | Add-Content -LiteralPath $lockLog
+            throw
+          }
+
+      - name: Upload validation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-runtime-validation-evidence
+          path: ${{ runner.temp }}/windows-runtime-validation-evidence/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
