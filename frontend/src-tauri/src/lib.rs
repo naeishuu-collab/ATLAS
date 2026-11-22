@@ -3644,7 +3644,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_plan, default_local_model, discard_pending_inference_setup_at,
+        boot_plan, default_local_model, discard_pending_inference_setup_at, has_in_progress_boot,
         exit_request_action,
         format_extension_import_failure, format_missing_rust_toolchain, format_port_unavailable,
         format_uv_sync_failure, format_uv_sync_spawn_error, managed_cloud_key_names,
@@ -3653,14 +3653,17 @@ mod tests {
         persist_confirmed_inference_config_at, preferred_installed_model,
         project_root_near_executable, reload_cloud_keys_for_owned_backend_at,
         should_persist_resolved_model, spawn_owned_child, stage_pending_inference_config_at,
-        startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, BackendManager,
-        InferenceConfig, InferenceCredentialStore, PendingInferenceRollback, SetupStatus,
-        SourceKind, DESKTOP_UV_SYNC_ARGS, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
-        AtomicU8, ExitRequestAction, Ordering, EXIT_IDLE, EXIT_STOPPED, EXIT_STOPPING,
+        startup_installed_model, stop_all_then, upsert_engine_host, uv_sync_stderr_tail,
+        BackendManager, ChildHandle, InferenceConfig, InferenceCredentialStore,
+        PendingInferenceRollback, SetupStatus, SourceKind, DESKTOP_UV_SYNC_ARGS,
+        DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY, AtomicU8, ExitRequestAction,
+        Mutex, Ordering, EXIT_IDLE, EXIT_STOPPED, EXIT_STOPPING,
     };
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     #[test]
     fn atlas_cloud_key_is_loaded_with_managed_desktop_keys() {

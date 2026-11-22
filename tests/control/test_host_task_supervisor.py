@@ -79,6 +79,7 @@ def test_host_supervisor_owns_real_worker_and_validates_live_authority(tmp_path)
             == evidence["worker_pid"]
         )
         supervisor.close()
+        assert supervisor.verify_exit_evidence(supervisor.evidence)
         assert supervisor.evidence["job_exit_confirmed"] is True
         assert supervisor.evidence["process_wait_confirmed"] is True
         assert supervisor.evidence["worker_exit_code"] == 0

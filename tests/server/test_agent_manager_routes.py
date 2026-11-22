@@ -385,6 +385,65 @@ class TestAgentManagerRoutes:
         assert captured[0].capability_policy is policy
         assert captured[0].rate_limiter is limiter
 
+    def test_task_routes_reject_different_agent(self, manager, client):
+        owner = manager.create_agent(name="owner", agent_type="simple")
+        other = manager.create_agent(name="other", agent_type="simple")
+        task = manager.create_task(owner["id"], "owned task")
+        path = f"/v1/managed-agents/{other['id']}/tasks/{task['id']}"
+
+        assert client.get(path).status_code == 404
+        assert client.patch(path, json={"status": "completed"}).status_code == 404
+        assert client.delete(path).status_code == 404
+        assert manager._get_task(task["id"]) == task
+        own_path = f"/v1/managed-agents/{owner['id']}/tasks/{task['id']}"
+        assert client.get(own_path).status_code == 200
+        assert client.patch(own_path, json={"status": "running"}).status_code == 200
+        assert client.delete(own_path).status_code == 200
+
+    def test_immediate_tick_carries_request_context_and_host_providers(
+        self, manager, client, monkeypatch
+    ):
+        from openjarvis.agents import executor as executor_module
+
+        browser_context, windows_context = object(), object()
+        browser_provider, windows_provider = object(), object()
+        captured = []
+
+        @client.app.middleware("http")
+        async def host_context(request, call_next):
+            request.state.browser_principal_context = browser_context
+            request.state.windows_principal_context = windows_context
+            return await call_next(request)
+
+        class CapturingExecutor:
+            def __init__(self, **kwargs):
+                pass
+
+            def set_system(self, system):
+                captured.append(system)
+
+            def execute_tick(self, *args, **kwargs):
+                pass
+
+        client.app.state.browser_session_provider = browser_provider
+        client.app.state.windows_session_provider = windows_provider
+        monkeypatch.setattr(executor_module, "AgentExecutor", CapturingExecutor)
+        monkeypatch.setattr(
+            "openjarvis.server.agent_manager_routes._start_managed_worker",
+            lambda state, target, **kwargs: target(),
+        )
+        agent = manager.create_agent(name="host-context", agent_type="simple")
+        response = client.post(
+            f"/v1/managed-agents/{agent['id']}/messages",
+            json={"content": "now", "mode": "immediate", "stream": False},
+        )
+        assert response.status_code == 200
+        system = captured[0]
+        assert system.browser_principal_context is browser_context
+        assert system.windows_principal_context is windows_context
+        assert system.browser_session_provider is browser_provider
+        assert system.windows_session_provider is windows_provider
+
 
 def test_run_agent_concurrent_returns_409(tmp_path):
     """Rapid Run Now clicks should not spawn multiple ticks."""

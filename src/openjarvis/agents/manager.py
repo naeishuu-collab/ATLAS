@@ -877,7 +877,7 @@ class AgentManager:
         worker_token: str | None = None,
         worker_epoch: int | None = None,
     ) -> int:
-        """Record integrity only; the trusted host must validate live leases."""
+        """Bind checkpoint integrity; host-session messages wait for lease proof."""
         if (
             not isinstance(integrity_key, bytes)
             or len(integrity_key) < 32
@@ -919,6 +919,22 @@ class AgentManager:
             state = checkpoint["tool_state"]
             if not isinstance(conversation_state, dict) or not isinstance(state, dict):
                 raise PermissionError("task checkpoint binding mismatch")
+            # shortcut: reject until Controller-verified lease proof reaches this API.
+            session_tools = ("browser_navigate", "windows_action")
+            messages = conversation_state.get("messages", [])
+            if not isinstance(messages, list):
+                raise PermissionError("task checkpoint binding mismatch")
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise PermissionError("task checkpoint binding mismatch")
+                if message.get("name") in session_tools:
+                    raise PermissionError("task checkpoint binding mismatch")
+                calls = message.get("tool_calls") or []
+                if not isinstance(calls, list) or any(
+                    not isinstance(call, dict) or call.get("name") in session_tools
+                    for call in calls
+                ):
+                    raise PermissionError("task checkpoint binding mismatch")
             if task["execution_attempt"] is not None and (
                 not isinstance(state, dict) or state.get("worker_epoch") != worker_epoch
             ):
