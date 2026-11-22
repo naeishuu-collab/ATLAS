@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -656,6 +657,31 @@ async fn stop_all_then(
     }
     status.lock().await.mark_stopped();
     after_stop()
+}
+
+const EXIT_IDLE: u8 = 0;
+const EXIT_STOPPING: u8 = 1;
+const EXIT_STOPPED: u8 = 2;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ExitRequestAction {
+    StartCleanup,
+    Prevent,
+    Allow,
+}
+
+fn exit_request_action(state: &AtomicU8) -> ExitRequestAction {
+    match state.compare_exchange(
+        EXIT_IDLE,
+        EXIT_STOPPING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => ExitRequestAction::StartCleanup,
+        Err(EXIT_STOPPING) => ExitRequestAction::Prevent,
+        Err(EXIT_STOPPED) => ExitRequestAction::Allow,
+        Err(_) => ExitRequestAction::Prevent,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,6 +3449,7 @@ async fn hide_overlay() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let backend: SharedBackend = Arc::new(Mutex::new(BackendManager::default()));
+    let exit_state = Arc::new(AtomicU8::new(EXIT_IDLE));
     let configured_at_launch = match read_configured_inference_config() {
         Some(cfg) if cfg.confirmed => {
             // A confirmed source never consumes a staging slot. Clear any
@@ -3581,14 +3608,31 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building OpenJarvis Desktop")
-        .run(move |_app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let b = backend.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = b.lock().await.stop_all().await {
-                        eprintln!("Backend shutdown could not be confirmed during exit: {error}");
+        .run(move |app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                match exit_request_action(&exit_state) {
+                    ExitRequestAction::Allow => {}
+                    ExitRequestAction::Prevent => api.prevent_exit(),
+                    ExitRequestAction::StartCleanup => {
+                        api.prevent_exit();
+                        let app = app.clone();
+                        let backend = backend.clone();
+                        let status = status.clone();
+                        let exit_state = exit_state.clone();
+                        let code = code.unwrap_or_default();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = stop_all_then(&backend, &status, || Ok(())).await {
+                                exit_state.store(EXIT_IDLE, Ordering::Release);
+                                eprintln!(
+                                    "Backend shutdown could not be confirmed during exit: {error}"
+                                );
+                                return;
+                            }
+                            exit_state.store(EXIT_STOPPED, Ordering::Release);
+                            app.exit(code);
+                        });
                     }
-                });
+                }
             }
         });
 }
@@ -3601,6 +3645,7 @@ pub fn run() {
 mod tests {
     use super::{
         boot_plan, default_local_model, discard_pending_inference_setup_at,
+        exit_request_action,
         format_extension_import_failure, format_missing_rust_toolchain, format_port_unavailable,
         format_uv_sync_failure, format_uv_sync_spawn_error, managed_cloud_key_names,
         matching_installed_model, model_names_match, normalize_host,
@@ -3611,6 +3656,7 @@ mod tests {
         startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, BackendManager,
         InferenceConfig, InferenceCredentialStore, PendingInferenceRollback, SetupStatus,
         SourceKind, DESKTOP_UV_SYNC_ARGS, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
+        AtomicU8, ExitRequestAction, Ordering, EXIT_IDLE, EXIT_STOPPED, EXIT_STOPPING,
     };
     use std::collections::HashMap;
     use std::path::Path;
@@ -4547,6 +4593,23 @@ mod tests {
         assert!(!jarvis_completed.exists());
         assert!(!ollama_completed.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exit_request_state_retries_after_cleanup_reset_and_allows_exit_after_success() {
+        let state = AtomicU8::new(EXIT_IDLE);
+
+        assert_eq!(exit_request_action(&state), ExitRequestAction::StartCleanup);
+        assert_eq!(state.load(Ordering::Acquire), EXIT_STOPPING);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::Prevent);
+
+        // The ExitRequested handler resets to idle when stop_all_then fails.
+        state.store(EXIT_IDLE, Ordering::Release);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::StartCleanup);
+
+        state.store(EXIT_STOPPED, Ordering::Release);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::Allow);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::Allow);
     }
 
     #[test]
