@@ -476,6 +476,15 @@ struct HostSupervisorStartError {
     retained: Option<HostSupervisorHandle>,
 }
 
+#[derive(Clone)]
+struct ControllerLaunchSpec {
+    root: std::path::PathBuf,
+    #[cfg(not(target_os = "windows"))]
+    uv_bin: String,
+    serve_argv: Vec<String>,
+    inference: InferenceConfig,
+}
+
 impl HostSupervisorHandle {
     async fn stop(&mut self) -> Result<(), String> {
         if !self.shutdown_attempted {
@@ -959,6 +968,7 @@ struct BackendManager {
     ollama: Option<ChildHandle>,
     jarvis: Option<ChildHandle>,
     host_supervisor: Option<HostSupervisorHandle>,
+    controller_launch: Option<ControllerLaunchSpec>,
     jarvis_stderr_tail: StderrTail,
     boot_task: Option<tauri::async_runtime::JoinHandle<()>>,
     untracked_child_unconfirmed: bool,
@@ -970,6 +980,7 @@ impl Default for BackendManager {
             ollama: None,
             jarvis: None,
             host_supervisor: None,
+            controller_launch: None,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
             boot_task: None,
             untracked_child_unconfirmed: false,
@@ -1050,11 +1061,55 @@ impl BackendManager {
         }
 
         if errors.is_empty() {
+            self.controller_launch = None;
             Ok(())
         } else {
             Err(errors.join("; "))
         }
     }
+}
+
+fn controller_command(
+    spec: &ControllerLaunchSpec,
+    cfg: &InferenceConfig,
+) -> Result<tokio::process::Command, String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = windows_python_command(&spec.root)?;
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = tokio::process::Command::new(&spec.uv_bin);
+
+    cmd.args(&spec.serve_argv)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(&spec.root);
+    prepare_subprocess_for_appimage(&mut cmd);
+    for (key, value) in cloud_keys_for_inference(cfg) {
+        cmd.env(key, value);
+    }
+    Ok(cmd)
+}
+
+async fn spawn_controller(
+    backend: &SharedBackend,
+    spec: &ControllerLaunchSpec,
+    cfg: &InferenceConfig,
+) -> Result<(), String> {
+    let mut cmd = controller_command(spec, cfg)?;
+    let mut manager = backend.lock().await;
+    if manager.jarvis.is_some() {
+        return Err("A Controller process is already owned by this desktop app.".into());
+    }
+    let mut child = spawn_owned_child(&mut cmd).map_err(|error| error.to_string())?;
+    let stderr = child.stderr.take();
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    manager.jarvis = Some(ChildHandle::new(child));
+    manager.jarvis_stderr_tail = tail.clone();
+    manager.controller_launch = Some(spec.clone());
+    drop(manager);
+    if let Some(stderr) = stderr {
+        spawn_jarvis_stderr_drainer(stderr, tail);
+    }
+    Ok(())
 }
 
 type SharedBackend = Arc<Mutex<BackendManager>>;
@@ -1099,6 +1154,11 @@ async fn start_managed_boot(backend: SharedBackend, status: SharedStatus) -> Res
             status.lock().await.mark_stop_unconfirmed(message.clone());
             return Err(message);
         }
+    }
+    if status_snapshot.phase == "controller_exited" {
+        let task = tauri::async_runtime::spawn(recover_controller(backend.clone(), status));
+        manager.boot_task = Some(task);
+        return Ok(());
     }
     if manager.jarvis.is_some() || manager.ollama.is_some() || manager.host_supervisor.is_some() {
         return Err(
@@ -1178,6 +1238,33 @@ impl SetupStatus {
             self.model_ready = false;
             self.error = None;
         }
+    }
+}
+
+fn observe_managed_controller_exit(manager: &mut BackendManager, status: &mut SetupStatus) {
+    if status.phase != "ready" || !status.server_ready {
+        return;
+    }
+    let Some(controller) = manager.jarvis.as_mut() else {
+        return;
+    };
+    match controller.child.try_wait() {
+        Ok(Some(exit)) => {
+            status.phase = "controller_exited".into();
+            status.server_ready = false;
+            let code = exit
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let detail =
+                format!("Controller exited (code {code}). Retry Server to restart the Controller.");
+            status.detail = detail.clone();
+            status.error = Some(detail);
+        }
+        Ok(None) => {}
+        Err(error) => status.mark_stop_unconfirmed(format!(
+            "Could not confirm Controller process status: {error}"
+        )),
     }
 }
 
@@ -2718,16 +2805,6 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.detail = format!("Starting API server from {}...", root.display());
     }
 
-    #[cfg(target_os = "windows")]
-    let mut cmd = match windows_python_command(root) {
-        Ok(command) => command,
-        Err(error) => {
-            status.lock().await.error = Some(error);
-            return;
-        }
-    };
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = tokio::process::Command::new(&uv_bin);
     let mut serve_argv: Vec<String> = Vec::new();
     #[cfg(target_os = "windows")]
     serve_argv.extend([
@@ -2763,46 +2840,22 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             ),
         }
     }
-    cmd.args(&serve_argv)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .current_dir(root);
-    // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455) —
-    // do this BEFORE cmd.env() calls below so our explicit cloud-key env
-    // additions aren't accidentally stripped.
-    prepare_subprocess_for_appimage(&mut cmd);
-
-    // Inject cloud API keys from secure desktop storage.
-    for (key, value) in cloud_keys_for_inference(&cfg) {
-        cmd.env(&key, &value);
-    }
-    let jarvis_child = spawn_owned_child(&mut cmd);
-
-    match jarvis_child {
-        Ok(mut child) => {
-            // Start draining stderr immediately. If we wait until the
-            // health check returns we risk filling the 4 KB Windows pipe
-            // buffer during startup logging and hanging the child before
-            // it can bind its HTTP port — exactly the symptom in #309.
-            let stderr_handle = child.stderr.take();
-            let mut mgr = backend.lock().await;
-            let tail = mgr.jarvis_stderr_tail.clone();
-            mgr.jarvis = Some(ChildHandle::new(child));
-            drop(mgr);
-            if let Some(stderr) = stderr_handle {
-                spawn_jarvis_stderr_drainer(stderr, tail);
-            }
-        }
-        Err(e) => {
-            let mut s = status.lock().await;
-            s.error = Some(format!(
-                "Could not start jarvis server: {}. \
-                 Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
-                e,
-                root.display(),
-            ));
-            return;
-        }
+    let launch = ControllerLaunchSpec {
+        root: root.to_path_buf(),
+        #[cfg(not(target_os = "windows"))]
+        uv_bin: uv_bin.clone(),
+        serve_argv: serve_argv.clone(),
+        inference: cfg.clone(),
+    };
+    if let Err(error) = spawn_controller(&backend, &launch, &cfg).await {
+        let mut s = status.lock().await;
+        s.error = Some(format!(
+            "Could not start jarvis server: {}. \
+             Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
+            error,
+            root.display(),
+        ));
+        return;
     }
 
     let server_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
@@ -2883,6 +2936,9 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.error = Some(format!("Could not confirm inference setup: {}", err));
         return;
     }
+    if let Some(launch) = backend.lock().await.controller_launch.as_mut() {
+        launch.inference = cfg.clone();
+    }
 
     {
         let mut s = status.lock().await;
@@ -2901,6 +2957,196 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // `pull_model` command invoked from the UI).
 }
 
+fn argument_matches(args: &[String], name: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == name && pair[1] == value)
+}
+
+async fn prepare_controller_recovery(
+    backend: &SharedBackend,
+) -> Result<ControllerLaunchSpec, String> {
+    let mut manager = backend.lock().await;
+    if manager.untracked_child_unconfirmed {
+        return Err("A startup child is untracked; Controller recovery is unsafe.".into());
+    }
+    if let Some(controller) = manager.jarvis.as_mut() {
+        match controller.child.try_wait() {
+            Ok(Some(_)) => manager.jarvis = None,
+            Ok(None) => return Err("The previous Controller is still running.".into()),
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the previous Controller exit: {error}"
+                ))
+            }
+        }
+    }
+
+    let launch = manager.controller_launch.clone().ok_or_else(|| {
+        "Controller launch details are unavailable; stop and start the backend.".to_string()
+    })?;
+
+    if let Some(host) = manager.host_supervisor.as_mut() {
+        if host.shutdown_attempted || host.shutdown_sent || host.child.id() != Some(host.pid) {
+            return Err(
+                "The existing Host Supervisor is shutting down or has an invalid identity.".into(),
+            );
+        }
+        match host.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err("The existing Host Supervisor has exited.".into()),
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the Host Supervisor is running: {error}"
+                ))
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if process_creation_filetime(&host.child)? != host.created_filetime {
+            return Err("The existing Host Supervisor creation time changed.".into());
+        }
+        if !argument_matches(&launch.serve_argv, "--host-bootstrap-pipe", &host.pipe_name)
+            || !argument_matches(
+                &launch.serve_argv,
+                "--host-supervisor-pid",
+                &host.pid.to_string(),
+            )
+            || !argument_matches(
+                &launch.serve_argv,
+                "--host-supervisor-created-filetime",
+                &host.created_filetime.to_string(),
+            )
+        {
+            return Err(
+                "Controller launch details do not match the existing Host Supervisor.".into(),
+            );
+        }
+    }
+
+    if let Some(ollama) = manager.ollama.as_mut() {
+        match ollama.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err("The managed inference engine has exited; restart the backend.".into())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the inference engine is running: {error}"
+                ))
+            }
+        }
+    }
+    Ok(launch)
+}
+
+async fn mark_controller_recovery_failure(
+    backend: &SharedBackend,
+    status: &SharedStatus,
+    error: String,
+    retry_if_exited: bool,
+) {
+    let can_retry = if retry_if_exited {
+        let mut manager = backend.lock().await;
+        match manager.jarvis.as_mut() {
+            Some(controller) => matches!(controller.child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    } else {
+        false
+    };
+    let mut status = status.lock().await;
+    status.phase = if can_retry {
+        "controller_exited".into()
+    } else {
+        "recovery_failed".into()
+    };
+    status.server_ready = false;
+    status.detail = error.clone();
+    status.error = Some(error);
+}
+
+async fn recover_controller(backend: SharedBackend, status: SharedStatus) {
+    let launch = match prepare_controller_recovery(&backend).await {
+        Ok(launch) => launch,
+        Err(error) => {
+            mark_controller_recovery_failure(&backend, &status, error, false).await;
+            return;
+        }
+    };
+    let Some(cfg) = read_configured_inference_config() else {
+        mark_controller_recovery_failure(
+            &backend,
+            &status,
+            "Saved inference source is unavailable; choose a source before restarting.".into(),
+            false,
+        )
+        .await;
+        return;
+    };
+    if cfg != launch.inference {
+        mark_controller_recovery_failure(
+            &backend,
+            &status,
+            "Saved inference source changed since Controller A started; stop and start the backend to apply it.".into(),
+            false,
+        )
+        .await;
+        return;
+    }
+    {
+        let mut status = status.lock().await;
+        status.phase = "server".into();
+        status.detail = "Restarting Controller...".into();
+        status.error = None;
+    }
+    if let Err(error) = spawn_controller(&backend, &launch, &cfg).await {
+        mark_controller_recovery_failure(&backend, &status, error, true).await;
+        return;
+    }
+
+    let server_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
+    match wait_for_jarvis_health(&server_url, Duration::from_secs(600), &backend).await {
+        JarvisStartResult::Ready => {
+            let mut status = status.lock().await;
+            status.server_ready = true;
+            status.phase = "ready".into();
+            status.detail = "Controller restarted; API server is ready.".into();
+            status.error = None;
+        }
+        JarvisStartResult::EarlyExit { code, stderr } => {
+            let code = code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let error = if stderr.is_empty() {
+                format!("Restarted Controller exited before becoming ready (code {code}).")
+            } else {
+                format!("Restarted Controller exited before becoming ready (code {code}).\n\nStderr:\n{stderr}")
+            };
+            mark_controller_recovery_failure(&backend, &status, error, true).await;
+        }
+        JarvisStartResult::ServiceUnavailable(body) => {
+            mark_controller_recovery_failure(
+                &backend,
+                &status,
+                format!(
+                    "Restarted Controller is running but unhealthy (HTTP 503): {}",
+                    body.trim()
+                ),
+                false,
+            )
+            .await;
+        }
+        JarvisStartResult::Timeout => {
+            let stderr = read_jarvis_stderr_tail(&backend).await;
+            let detail = if stderr.is_empty() {
+                "Restarted Controller did not become healthy within 10 minutes.".into()
+            } else {
+                format!("Restarted Controller did not become healthy within 10 minutes.\n\nStderr:\n{stderr}")
+            };
+            mark_controller_recovery_failure(&backend, &status, detail, false).await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -2910,8 +3156,14 @@ fn api_base() -> String {
 }
 
 #[tauri::command]
-async fn get_setup_status(state: tauri::State<'_, SharedStatus>) -> Result<SetupStatus, String> {
-    Ok(state.lock().await.clone())
+async fn get_setup_status(
+    backend: tauri::State<'_, SharedBackend>,
+    state: tauri::State<'_, SharedStatus>,
+) -> Result<SetupStatus, String> {
+    let mut manager = backend.lock().await;
+    let mut status = state.lock().await;
+    observe_managed_controller_exit(&mut manager, &mut status);
+    Ok(status.clone())
 }
 
 #[tauri::command]
@@ -3679,7 +3931,7 @@ impl Default for SourceKind {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 struct InferenceConfig {
     #[serde(default)]
     kind: SourceKind,
@@ -4724,6 +4976,57 @@ mod tests {
         if exit_code != 0 {
             std::process::exit(exit_code);
         }
+    }
+
+    #[test]
+    fn controller_exit_fixture() {
+        let Ok(code) = std::env::var("ATLAS_CONTROLLER_EXIT_FIXTURE") else {
+            return;
+        };
+        std::process::exit(code.parse::<i32>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ready_status_exposes_a_confirmed_controller_exit_for_retry() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::controller_exit_fixture", "--nocapture"])
+            .env("ATLAS_CONTROLLER_EXIT_FIXTURE", "23")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = super::spawn_owned_child(&mut command).unwrap();
+        let mut manager = super::BackendManager::default();
+        manager.jarvis = Some(super::ChildHandle::new(child));
+        let mut status = super::SetupStatus {
+            phase: "ready".into(),
+            server_ready: true,
+            ..Default::default()
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = manager
+                .jarvis
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        super::observe_managed_controller_exit(&mut manager, &mut status);
+        assert_eq!(status.phase, "controller_exited");
+        assert!(!status.server_ready);
+        assert!(status.error.as_deref().unwrap().contains("code 23"));
     }
 
     #[test]
