@@ -5984,6 +5984,40 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_exit_requests_start_cleanup_once_and_block_reentry() {
+        const CALLERS: usize = 32;
+        let state = Arc::new(AtomicU8::new(EXIT_IDLE));
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS + 1));
+        let requests = (0..CALLERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    exit_request_action(&state)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let mut cleanup_starts = 0;
+        let mut prevented = 0;
+        for request in requests {
+            match request.join().expect("exit request thread should complete") {
+                ExitRequestAction::StartCleanup => cleanup_starts += 1,
+                ExitRequestAction::Prevent => prevented += 1,
+                ExitRequestAction::Allow => panic!("exit must wait for cleanup"),
+            }
+        }
+        assert_eq!(cleanup_starts, 1);
+        assert_eq!(prevented, CALLERS - 1);
+        assert_eq!(state.load(Ordering::Acquire), EXIT_STOPPING);
+
+        state.store(EXIT_STOPPED, Ordering::Release);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::Allow);
+    }
+
+    #[test]
     fn stop_unconfirmed_status_preserves_last_known_readiness() {
         let config = InferenceConfig::default();
         let mut status = SetupStatus::starting(&config);
