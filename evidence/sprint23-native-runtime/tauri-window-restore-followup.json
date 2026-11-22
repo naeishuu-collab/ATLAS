@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-11-22T08:36:16Z",
+  "change": {
+    "file": "frontend/src-tauri/src/lib.rs",
+    "behavior": "The single-instance callback now unminimizes and shows the main window before focusing it."
+  },
+  "verification": {
+    "cargo_fmt_check": "PASS",
+    "cargo_build": "PASS",
+    "profile": "locked Windows MSVC release",
+    "rustc": "1.100.0",
+    "msvc_toolset": "14.50.35717",
+    "windows_sdk": "10.0.26100.0",
+    "binary_sha256": "2167CB5CFA8447D963478ACFD7543B8FB88539DA058AABB273C036799B807272",
+    "binary_size_bytes": 21879808
+  },
+  "gui_check": {
+    "result": "BLOCKED",
+    "observation": "The existing OpenJarvis window remained minimized; Computer Use could not read its window state, and launching the rebuilt executable did not restore it.",
+    "classification": "No post-change GUI run; the 21-step Tauri product-path E2E remains PARTIAL."
+  },
+  "limits": [
+    "The rebuilt executable was not started in a fresh GUI process.",
+    "Controller A-to-B recovery, synthetic task dispatch, worker journal/checkpoint, fencing/replay, UNKNOWN_OUTCOME, and ExitRequested outer-Job cleanup remain unverified through the Tauri GUI."
+  ]
+}
