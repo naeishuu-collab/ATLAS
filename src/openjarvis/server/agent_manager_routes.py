@@ -317,6 +317,12 @@ class _LightweightSystem:
         self._runtime = runtime
         self.capability_policy = getattr(runtime, "capability_policy", None)
         self.rate_limiter = getattr(runtime, "rate_limiter", None)
+        self.browser_session_provider = getattr(
+            runtime, "browser_session_provider", None
+        )
+        self.windows_session_provider = getattr(
+            runtime, "windows_session_provider", None
+        )
         # Wire the configured memory backend so an agent's memory_store /
         # memory_retrieve tools work when the tick runs through the server.
         # The executor injects system.memory_backend into those tools; this
@@ -2679,6 +2685,8 @@ def create_agent_manager_router(
             _srv_model = getattr(_app_state, "model", "")
             _srv_config = getattr(_app_state, "config", None)
             _srv_bus = _get_runtime_event_bus(_app_state)
+            _browser_context = getattr(request.state, "browser_principal_context", None)
+            _windows_context = getattr(request.state, "windows_principal_context", None)
 
             def _immediate_tick():
                 _start = _time.time()
@@ -2700,6 +2708,8 @@ def create_agent_manager_router(
                         _srv_config,
                         _app_state,
                     )
+                    system.browser_principal_context = _browser_context
+                    system.windows_principal_context = _windows_context
                     executor.set_system(system)
                     logger.info(
                         "Immediate tick: system ready in %.1fs, "

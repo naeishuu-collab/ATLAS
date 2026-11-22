@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "recorded_at_utc": "2026-11-22T09:27:54.9788700Z",
+  "base_commit": "378ced5f2ee63a2558d6c43555e85a217033a0a4",
+  "change": "Adds explicit retry for a confirmed Controller exit through the existing owned backend, validates the pinned Host Supervisor identity and saved source, and re-reads credentials from secure storage.",
+  "verification": {
+    "cargo_fmt_check": "PASS",
+    "tauri_rust_lib_tests": {
+      "passed": 71,
+      "failed": 0,
+      "command": "cargo test --locked --manifest-path frontend/src-tauri/Cargo.toml --lib"
+    },
+    "tauri_release_build": "PASS"
+  },
+  "release_artifact": {
+    "path": "evidence\\sprint23-native-runtime\\cargo-target\\release\\openjarvis-desktop.exe",
+    "sha256": "88F1A24592596C9370CDA4FBD5DFAF3D2B638A689DA3EE94CB2965E77D320A1C",
+    "bytes": 21934592
+  },
+  "unverified": [
+    "Tauri GUI Controller A-to-B recovery was not run because the user said the Tauri screen is unavailable now.",
+    "Synthetic Task through the GUI and outer Job shutdown remain unverified."
+  ]
+}

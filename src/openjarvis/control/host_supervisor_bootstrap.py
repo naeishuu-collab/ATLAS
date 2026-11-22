@@ -787,6 +787,8 @@ class HostSupervisorBootstrapService:
                     raise PermissionError("Host control message invalid") from exc
                 if not isinstance(value, dict) or not self._handle_control(value):
                     break
+                if value.get("operation") == "REGISTER_CONTROLLER":
+                    print("ATLAS_HOST_REGISTERED", flush=True)
         finally:
             self.close()
 

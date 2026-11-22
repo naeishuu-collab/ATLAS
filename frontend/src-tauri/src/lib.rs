@@ -1,10 +1,13 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
@@ -71,21 +74,17 @@ fn total_ram_gb() -> f64 {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-        // wmic returns TotalVisibleMemorySize in KB
-        if let Ok(output) = Command::new("wmic")
-            .args(["OS", "get", "TotalVisibleMemorySize", "/value"])
-            .output()
+        let mut memory = windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<
+                windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX,
+            >() as u32,
+            ..Default::default()
+        };
+        if unsafe {
+            windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut memory)
+        } != 0
         {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                for line in s.lines() {
-                    if let Some(val) = line.strip_prefix("TotalVisibleMemorySize=") {
-                        if let Ok(kb) = val.trim().parse::<u64>() {
-                            return kb as f64 / (1024.0 * 1024.0);
-                        }
-                    }
-                }
-            }
+            return memory.ullTotalPhys as f64 / (1024.0 * 1024.0 * 1024.0);
         }
     }
     8.0
@@ -197,6 +196,101 @@ fn home_dir() -> String {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "windows")]
+fn windows_python_executable(root: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let venv = root.join(".venv");
+    let config_path = venv.join("pyvenv.cfg");
+    let config = std::fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "Could not read the Python virtual-environment configuration at {}: {error}",
+            config_path.display()
+        )
+    })?;
+    let mut configured_executable = None;
+    let mut configured_home = None;
+    for line in config.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = std::path::PathBuf::from(value.trim().trim_matches('"'));
+        match key.trim() {
+            "executable" => configured_executable = Some(value),
+            "home" => configured_home = Some(value),
+            _ => {}
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(executable) = configured_executable {
+        candidates.push(executable);
+    }
+    if let Some(home) = configured_home {
+        if home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("python.exe"))
+        {
+            candidates.push(home);
+        } else {
+            candidates.push(home.join("python.exe"));
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            format!(
+                "Could not find the base Python executable named by {}",
+                config_path.display()
+            )
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn windows_python_command(root: &std::path::Path) -> Result<tokio::process::Command, String> {
+    let executable = windows_python_executable(root)?;
+    let venv = root.join(".venv");
+    let mut path_entries = Vec::new();
+    if let Some(parent) = executable.parent() {
+        path_entries.push(parent.to_path_buf());
+    }
+    path_entries.push(venv.join("Scripts"));
+    if let Some(path) = std::env::var_os("PATH") {
+        path_entries.extend(std::env::split_paths(&path));
+    }
+    let path = std::env::join_paths(path_entries)
+        .map_err(|error| format!("Could not prepare the Python executable path: {error}"))?;
+    let python_path =
+        std::env::join_paths([root.join("src"), venv.join("Lib").join("site-packages")])
+            .map_err(|error| format!("Could not prepare the Python package path: {error}"))?;
+
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .env("VIRTUAL_ENV", venv)
+        .env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONPATH", python_path)
+        .env_remove("PYTHONHOME")
+        .env("PATH", path);
+    Ok(command)
+}
+
+fn executable_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(target_os = "windows")]
+        if !name.to_ascii_lowercase().ends_with(".exe") {
+            let candidate = directory.join(format!("{name}.exe"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve full path to a binary by checking common locations.
 /// macOS .app bundles don't inherit the shell PATH, so we probe manually.
 fn resolve_bin(name: &str) -> String {
@@ -242,38 +336,8 @@ fn resolve_bin(name: &str) -> String {
         }
     }
 
-    // Fallback: ask the OS to find it on PATH.
-    // On Windows this uses `where.exe`, on Unix `which`.
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(output) = std::process::Command::new("where")
-            .arg(format!("{name}.exe"))
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let p = first_line.trim();
-                    if !p.is_empty() && std::path::Path::new(p).exists() {
-                        return p.to_string();
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(output) = std::process::Command::new("which").arg(name).output() {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let p = first_line.trim();
-                    if !p.is_empty() && std::path::Path::new(p).exists() {
-                        return p.to_string();
-                    }
-                }
-            }
-        }
+    if let Some(path) = executable_on_path(name) {
+        return path.to_string_lossy().into_owned();
     }
 
     name.to_string()
@@ -388,13 +452,70 @@ fn project_root_near_executable(exe: &std::path::Path) -> Option<std::path::Path
 }
 
 // ---------------------------------------------------------------------------
-// BackendManager — owns the Ollama + Jarvis server child processes
+// BackendManager — owns the inference and Host Supervisor child processes
 // ---------------------------------------------------------------------------
 
 struct ChildHandle {
     child: tokio::process::Child,
     #[cfg(test)]
     fail_kill: bool,
+}
+
+struct HostSupervisorHandle {
+    child: tokio::process::Child,
+    control: Option<tokio::process::ChildStdin>,
+    shutdown_attempted: bool,
+    shutdown_sent: bool,
+    pipe_name: String,
+    pid: u32,
+    created_filetime: u64,
+}
+
+struct HostSupervisorStartError {
+    detail: String,
+    retained: Option<HostSupervisorHandle>,
+}
+
+#[derive(Clone)]
+struct ControllerLaunchSpec {
+    root: std::path::PathBuf,
+    #[cfg(not(target_os = "windows"))]
+    uv_bin: String,
+    serve_argv: Vec<String>,
+    inference: InferenceConfig,
+}
+
+impl HostSupervisorHandle {
+    async fn stop(&mut self) -> Result<(), String> {
+        if !self.shutdown_attempted {
+            self.shutdown_attempted = true;
+            let control = self
+                .control
+                .as_mut()
+                .ok_or_else(|| "Host Supervisor control pipe is unavailable".to_string())?;
+            let request = b"{\"operation\":\"SHUTDOWN\"}\n";
+            control
+                .write_all(request)
+                .await
+                .map_err(|error| format!("Could not request Host Supervisor shutdown: {error}"))?;
+            control.flush().await.map_err(|error| {
+                format!("Could not confirm Host Supervisor shutdown request: {error}")
+            })?;
+            self.shutdown_sent = true;
+        }
+        if !self.shutdown_sent {
+            return Err("Host Supervisor shutdown request is unconfirmed".into());
+        }
+
+        match tokio::time::timeout(Duration::from_secs(60), self.child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(format!(
+                "Host Supervisor exited with status {status}; cleanup is unconfirmed"
+            )),
+            Ok(Err(error)) => Err(format!("Could not confirm Host Supervisor exit: {error}")),
+            Err(_) => Err("Host Supervisor shutdown timed out; cleanup is unconfirmed".into()),
+        }
+    }
 }
 
 impl ChildHandle {
@@ -437,7 +558,401 @@ impl ChildHandle {
 /// `kill_on_drop(true)` before `output()`).
 fn spawn_owned_child(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
     cmd.kill_on_drop(true);
-    cmd.spawn()
+    #[cfg(target_os = "windows")]
+    {
+        let job = if cfg!(test) && PROCESS_JOB.get().is_none() {
+            None
+        } else {
+            Some(process_job().map_err(std::io::Error::other)?)
+        };
+        if let Some(job) = job {
+            let spawn_gate = process_spawn_gate()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if spawn_gate.exiting {
+                return Err(std::io::Error::other(
+                    "Tauri is shutting down; refusing to start a child process",
+                ));
+            }
+            use std::os::windows::process::CommandExt;
+            cmd.as_std_mut()
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+            let child = cmd.spawn()?;
+            if let Err(error) = job.assign_and_resume(&child) {
+                match terminate_and_confirm(&child) {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => {
+                        retain_unconfirmed_child(child);
+                        Err(std::io::Error::other(format!(
+                            "{error}; child termination is unconfirmed: {cleanup_error}"
+                        )))
+                    }
+                }
+            } else {
+                Ok(child)
+            }
+        } else {
+            cmd.spawn()
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd.spawn()
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsProcessJob {
+    handle: StdMutex<Option<std::os::windows::io::OwnedHandle>>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct ProcessSpawnGate {
+    exiting: bool,
+}
+
+#[cfg(target_os = "windows")]
+static PROCESS_SPAWN_GATE: OnceLock<StdMutex<ProcessSpawnGate>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static PROCESS_JOB: OnceLock<Result<WindowsProcessJob, String>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+static RETAINED_CHILDREN: OnceLock<StdMutex<Vec<tokio::process::Child>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+impl WindowsProcessJob {
+    fn new() -> std::io::Result<Self> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        let raw = unsafe {
+            windows_sys::Win32::System::JobObjects::CreateJobObjectW(
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if raw.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let success = unsafe {
+            SetInformationJobObject(
+                raw,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            handle: StdMutex::new(Some(handle)),
+        })
+    }
+
+    fn raw_handle(&self) -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
+        use std::os::windows::io::AsRawHandle;
+        self.handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(AsRawHandle::as_raw_handle)
+            .ok_or_else(|| std::io::Error::other("Tauri Job Object handle is closed"))
+    }
+
+    fn close(&self) -> std::io::Result<()> {
+        use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+        let mut handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(owned) = handle.take() else {
+            return Ok(());
+        };
+        let raw = owned.into_raw_handle();
+        if unsafe { windows_sys::Win32::Foundation::CloseHandle(raw) } == 0 {
+            let error = std::io::Error::last_os_error();
+            *handle = Some(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) });
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn assign_and_resume(&self, child: &tokio::process::Child) -> std::io::Result<()> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, IsProcessInJob};
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        let job_handle = self.raw_handle()?;
+        let process = child
+            .raw_handle()
+            .ok_or_else(|| std::io::Error::other("child process handle is unavailable"))?;
+        if unsafe { AssignProcessToJobObject(job_handle, process) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut is_member = 0;
+        if unsafe { IsProcessInJob(process, job_handle, &mut is_member) } == 0 || is_member == 0 {
+            return Err(std::io::Error::other(
+                "Windows did not confirm child membership in the Tauri Job Object",
+            ));
+        }
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let snapshot = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(snapshot) };
+        let pid = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("child process id is unavailable"))?;
+        let mut entry = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut primary_thread = None;
+        let mut found = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
+        while found {
+            if entry.th32OwnerProcessID == pid {
+                if primary_thread.replace(entry.th32ThreadID).is_some() {
+                    return Err(std::io::Error::other(
+                        "suspended child unexpectedly has multiple threads",
+                    ));
+                }
+            }
+            found = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
+        }
+        let thread_id = primary_thread
+            .ok_or_else(|| std::io::Error::other("suspended child thread was not found"))?;
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let thread = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(thread) };
+        let previous_count = unsafe { ResumeThread(thread.as_raw_handle()) };
+        if previous_count == u32::MAX {
+            return Err(std::io::Error::last_os_error());
+        }
+        if previous_count != 1 {
+            return Err(std::io::Error::other(format!(
+                "primary thread had unexpected suspend count {previous_count}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let job_handle = self.raw_handle()?;
+        let success = unsafe {
+            QueryInformationJobObject(
+                job_handle,
+                JobObjectBasicAccountingInformation,
+                &mut accounting as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if success == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
+    }
+
+    fn terminate_all(&self) -> std::io::Result<()> {
+        let job_handle = self.raw_handle()?;
+        if unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job_handle, 1) } == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn process_job() -> Result<&'static WindowsProcessJob, String> {
+    PROCESS_JOB
+        .get_or_init(|| WindowsProcessJob::new().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|error| error.clone())
+}
+
+#[cfg(target_os = "windows")]
+fn process_spawn_gate() -> &'static StdMutex<ProcessSpawnGate> {
+    PROCESS_SPAWN_GATE.get_or_init(|| StdMutex::new(ProcessSpawnGate::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn mark_process_job_exiting() {
+    process_spawn_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .exiting = true;
+}
+
+#[cfg(target_os = "windows")]
+fn retain_unconfirmed_child(child: tokio::process::Child) {
+    let mut children = RETAINED_CHILDREN
+        .get_or_init(|| StdMutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    children.push(child);
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_and_confirm(child: &tokio::process::Child) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, INFINITE};
+
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| std::io::Error::other("child process handle is unavailable"))?;
+    if unsafe { TerminateProcess(process, 1) } == 0
+        && unsafe { WaitForSingleObject(process, 0) } != WAIT_OBJECT_0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { WaitForSingleObject(process, INFINITE) } == WAIT_OBJECT_0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_process_job() {
+    let _ = process_job();
+}
+
+#[cfg(target_os = "windows")]
+async fn stop_process_job_tree() -> Result<(), String> {
+    if cfg!(test) && PROCESS_JOB.get().is_none() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(stop_process_job_tree_blocking)
+        .await
+        .map_err(|error| format!("Could not wait for Tauri Job Object shutdown: {error}"))?
+}
+
+#[cfg(target_os = "windows")]
+fn stop_process_job_tree_blocking() -> Result<(), String> {
+    let _spawn_gate = process_spawn_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(job_state) = PROCESS_JOB.get() else {
+        return Ok(());
+    };
+    let Ok(job) = job_state.as_ref() else {
+        // Initialization failure is fail-closed for all spawns, so no child
+        // was created through this process path and there is no job to drain.
+        return Ok(());
+    };
+    let mut active = job
+        .active_processes()
+        .map_err(|error| format!("Could not query Tauri Job Object membership: {error}"))?;
+    if active > 0 {
+        job.terminate_all()
+            .map_err(|error| format!("Could not terminate the Tauri Job Object: {error}"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            active = job
+                .active_processes()
+                .map_err(|error| format!("Could not confirm Tauri Job Object shutdown: {error}"))?;
+            if active == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Tauri Job Object still contains {active} process(es) after termination"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    retry_unconfirmed_child_cleanup_blocking()
+}
+
+#[cfg(target_os = "windows")]
+fn close_process_job() -> Result<(), String> {
+    let _spawn_gate = process_spawn_gate()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(job_state) = PROCESS_JOB.get() else {
+        return Ok(());
+    };
+    match job_state {
+        Ok(job) => job
+            .close()
+            .map_err(|error| format!("Could not close Tauri Job Object handle: {error}")),
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn retry_unconfirmed_child_cleanup_blocking() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject, INFINITE};
+
+    let retained = {
+        let Some(children) = RETAINED_CHILDREN.get() else {
+            return Ok(());
+        };
+        std::mem::take(
+            &mut *children
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    };
+    let mut remaining = Vec::new();
+    for mut child in retained {
+        let stopped = if let Some(process) = child.raw_handle() {
+            if unsafe { TerminateProcess(process, 1) } == 0
+                && unsafe { WaitForSingleObject(process, 0) } != WAIT_OBJECT_0
+            {
+                false
+            } else {
+                (unsafe { WaitForSingleObject(process, INFINITE) }) == WAIT_OBJECT_0
+            }
+        } else {
+            matches!(child.try_wait(), Ok(Some(_)))
+        };
+        if !stopped {
+            remaining.push(child);
+        }
+    }
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        let count = remaining.len();
+        RETAINED_CHILDREN
+            .get_or_init(|| StdMutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(remaining);
+        Err(format!(
+            "Cleanup remains unconfirmed for {count} child process(es)"
+        ))
+    }
 }
 
 /// Rolling buffer holding the most recent ~16 KB of jarvis stderr.
@@ -452,6 +967,8 @@ const STDERR_TAIL_LIMIT: usize = 16 * 1024;
 struct BackendManager {
     ollama: Option<ChildHandle>,
     jarvis: Option<ChildHandle>,
+    host_supervisor: Option<HostSupervisorHandle>,
+    controller_launch: Option<ControllerLaunchSpec>,
     jarvis_stderr_tail: StderrTail,
     boot_task: Option<tauri::async_runtime::JoinHandle<()>>,
     untracked_child_unconfirmed: bool,
@@ -462,6 +979,8 @@ impl Default for BackendManager {
         Self {
             ollama: None,
             jarvis: None,
+            host_supervisor: None,
+            controller_launch: None,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
             boot_task: None,
             untracked_child_unconfirmed: false,
@@ -497,6 +1016,23 @@ impl BackendManager {
             None => {}
         }
 
+        if self.host_supervisor.is_some() {
+            if self.jarvis.is_none() && !self.untracked_child_unconfirmed {
+                if let Some(supervisor) = self.host_supervisor.as_mut() {
+                    match supervisor.stop().await {
+                        Ok(()) => self.host_supervisor = None,
+                        Err(error) => {
+                            errors.push(format!("Could not stop Host Supervisor: {error}"));
+                        }
+                    }
+                }
+            } else {
+                errors.push(
+                    "Host Supervisor retained because Controller shutdown is unconfirmed".into(),
+                );
+            }
+        }
+
         let ollama_result = if let Some(handle) = self.ollama.as_mut() {
             Some(handle.kill().await)
         } else {
@@ -508,12 +1044,72 @@ impl BackendManager {
             None => {}
         }
 
+        #[cfg(target_os = "windows")]
+        if PROCESS_JOB.get().is_some() {
+            match stop_process_job_tree().await {
+                Ok(()) => {
+                    // Job membership is the final authority: a confirmed empty
+                    // job means even an unresponsive child tree is stopped.
+                    errors.clear();
+                    self.untracked_child_unconfirmed = false;
+                    self.jarvis = None;
+                    self.ollama = None;
+                    self.host_supervisor = None;
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+
         if errors.is_empty() {
+            self.controller_launch = None;
             Ok(())
         } else {
             Err(errors.join("; "))
         }
     }
+}
+
+fn controller_command(
+    spec: &ControllerLaunchSpec,
+    cfg: &InferenceConfig,
+) -> Result<tokio::process::Command, String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = windows_python_command(&spec.root)?;
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = tokio::process::Command::new(&spec.uv_bin);
+
+    cmd.args(&spec.serve_argv)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(&spec.root);
+    prepare_subprocess_for_appimage(&mut cmd);
+    for (key, value) in cloud_keys_for_inference(cfg) {
+        cmd.env(key, value);
+    }
+    Ok(cmd)
+}
+
+async fn spawn_controller(
+    backend: &SharedBackend,
+    spec: &ControllerLaunchSpec,
+    cfg: &InferenceConfig,
+) -> Result<(), String> {
+    let mut cmd = controller_command(spec, cfg)?;
+    let mut manager = backend.lock().await;
+    if manager.jarvis.is_some() {
+        return Err("A Controller process is already owned by this desktop app.".into());
+    }
+    let mut child = spawn_owned_child(&mut cmd).map_err(|error| error.to_string())?;
+    let stderr = child.stderr.take();
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    manager.jarvis = Some(ChildHandle::new(child));
+    manager.jarvis_stderr_tail = tail.clone();
+    manager.controller_launch = Some(spec.clone());
+    drop(manager);
+    if let Some(stderr) = stderr {
+        spawn_jarvis_stderr_drainer(stderr, tail);
+    }
+    Ok(())
 }
 
 type SharedBackend = Arc<Mutex<BackendManager>>;
@@ -532,10 +1128,7 @@ fn has_in_progress_boot(manager: &BackendManager, status: &SetupStatus) -> bool 
 
 /// Spawn exactly one tracked boot task. Keeping its handle lets recovery
 /// abort an in-flight endpoint check/model download before killing children.
-async fn start_managed_boot(
-    backend: SharedBackend,
-    status: SharedStatus,
-) -> Result<(), String> {
+async fn start_managed_boot(backend: SharedBackend, status: SharedStatus) -> Result<(), String> {
     let status_snapshot = status.lock().await.clone();
     let mut manager = backend.lock().await;
     if manager.untracked_child_unconfirmed {
@@ -562,7 +1155,12 @@ async fn start_managed_boot(
             return Err(message);
         }
     }
-    if manager.jarvis.is_some() || manager.ollama.is_some() {
+    if status_snapshot.phase == "controller_exited" {
+        let task = tauri::async_runtime::spawn(recover_controller(backend.clone(), status));
+        manager.boot_task = Some(task);
+        return Ok(());
+    }
+    if manager.jarvis.is_some() || manager.ollama.is_some() || manager.host_supervisor.is_some() {
         return Err(
             "A previous startup still owns backend processes; stop them before retrying.".into(),
         );
@@ -640,6 +1238,33 @@ impl SetupStatus {
             self.model_ready = false;
             self.error = None;
         }
+    }
+}
+
+fn observe_managed_controller_exit(manager: &mut BackendManager, status: &mut SetupStatus) {
+    if status.phase != "ready" || !status.server_ready {
+        return;
+    }
+    let Some(controller) = manager.jarvis.as_mut() else {
+        return;
+    };
+    match controller.child.try_wait() {
+        Ok(Some(exit)) => {
+            status.phase = "controller_exited".into();
+            status.server_ready = false;
+            let code = exit
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let detail =
+                format!("Controller exited (code {code}). Retry Server to restart the Controller.");
+            status.detail = detail.clone();
+            status.error = Some(detail);
+        }
+        Ok(None) => {}
+        Err(error) => status.mark_stop_unconfirmed(format!(
+            "Could not confirm Controller process status: {error}"
+        )),
     }
 }
 
@@ -778,6 +1403,442 @@ fn spawn_jarvis_stderr_drainer(mut stderr: tokio::process::ChildStderr, tail: St
             }
         }
     });
+}
+
+fn parse_host_supervisor_ready_line(line: &str) -> Result<(u32, u64), String> {
+    let payload = line
+        .strip_prefix("ATLAS_HOST_READY:")
+        .ok_or_else(|| "Host Supervisor readiness record is invalid".to_string())?
+        .trim_end_matches(['\r', '\n']);
+    let mut fields = payload.split(':');
+    let pid = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Host Supervisor PID is invalid".to_string())?;
+    let created_filetime = fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "Host Supervisor creation time is invalid".to_string())?;
+    if fields.next().is_some() {
+        return Err("Host Supervisor readiness record has extra fields".into());
+    }
+    Ok((pid, created_filetime))
+}
+
+fn parse_host_supervisor_config(contents: &str) -> Result<bool, String> {
+    let document = contents
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("OpenJarvis configuration is invalid: {error}"))?;
+    let Some(enabled) = document
+        .get("agent_manager")
+        .and_then(|section| section.get("enabled"))
+    else {
+        return Ok(true);
+    };
+    enabled
+        .as_bool()
+        .ok_or_else(|| "agent_manager.enabled must be a boolean".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn host_supervisor_enabled(root: &std::path::Path) -> Result<bool, String> {
+    use std::path::PathBuf;
+
+    fn expand_home(value: &str, root: &std::path::Path) -> PathBuf {
+        let home_value = home_dir();
+        let home = if home_value.is_empty() {
+            root.to_path_buf()
+        } else {
+            PathBuf::from(home_value)
+        };
+        if value == "~" {
+            return home;
+        }
+        if let Some(suffix) = value
+            .strip_prefix("~/")
+            .or_else(|| value.strip_prefix("~\\"))
+        {
+            return home.join(suffix);
+        }
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    }
+
+    let config_dir = match std::env::var("OPENJARVIS_HOME") {
+        Ok(value) if !value.is_empty() => expand_home(&value, root),
+        _ => match std::env::var("XDG_DATA_HOME") {
+            Ok(value) if !value.is_empty() => expand_home(&value, root).join("openjarvis"),
+            _ => {
+                let home = home_dir();
+                let home = if home.is_empty() {
+                    root.to_path_buf()
+                } else {
+                    PathBuf::from(home)
+                };
+                home.join(".openjarvis")
+            }
+        },
+    };
+    let config_path = config_dir.join("config.toml");
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => {
+            return Err(format!(
+                "Could not read OpenJarvis configuration at {}: {error}",
+                config_path.display()
+            ));
+        }
+    };
+    parse_host_supervisor_config(&contents)
+}
+
+#[cfg(target_os = "windows")]
+async fn start_host_supervisor(
+    root: &std::path::Path,
+) -> Result<Option<HostSupervisorHandle>, HostSupervisorStartError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    if !host_supervisor_enabled(root).map_err(|detail| HostSupervisorStartError {
+        detail,
+        retained: None,
+    })? {
+        return Ok(None);
+    }
+    let mut command = windows_python_command(root).map_err(|detail| HostSupervisorStartError {
+        detail,
+        retained: None,
+    })?;
+    let tick = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pipe_name = format!(r"\\.\pipe\atlas-host-{}-{tick:x}", std::process::id());
+    command
+        .args([
+            "-m",
+            "openjarvis.cli",
+            "--quiet",
+            "host-supervisor",
+            "--pipe-name",
+            &pipe_name,
+        ])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    prepare_subprocess_for_appimage(&mut command);
+    add_cargo_bin_to_path(&mut command);
+    let mut child = spawn_owned_child(&mut command).map_err(|error| HostSupervisorStartError {
+        detail: format!("Could not start Host Supervisor: {error}"),
+        retained: None,
+    })?;
+    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
+    if let Some(stderr) = child.stderr.take() {
+        spawn_jarvis_stderr_drainer(stderr, tail.clone());
+    }
+    let expected_pid = match child.id() {
+        Some(pid) => pid,
+        None => {
+            return Err(host_supervisor_start_failure(
+                child,
+                pipe_name,
+                0,
+                0,
+                None,
+                None,
+                "Host Supervisor process identity is unavailable".into(),
+                &tail,
+            )
+            .await);
+        }
+    };
+    let expected_created_filetime = match process_creation_filetime(&child) {
+        Ok(created_filetime) => created_filetime,
+        Err(error) => {
+            return Err(host_supervisor_start_failure(
+                child,
+                pipe_name,
+                expected_pid,
+                0,
+                None,
+                None,
+                format!("Could not verify Host Supervisor process identity: {error}"),
+                &tail,
+            )
+            .await);
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let failure = host_supervisor_start_failure(
+                child,
+                pipe_name,
+                expected_pid,
+                expected_created_filetime,
+                None,
+                None,
+                "Host Supervisor readiness stream is unavailable".into(),
+                &tail,
+            )
+            .await;
+            return Err(failure);
+        }
+    };
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let ready = tokio::time::timeout(Duration::from_secs(60), reader.read_line(&mut line)).await;
+    if !matches!(ready, Ok(Ok(length)) if length > 0) {
+        let detail = match ready {
+            Ok(Ok(_)) => "Host Supervisor exited before becoming ready".to_string(),
+            Ok(Err(error)) => format!("Could not read Host Supervisor readiness: {error}"),
+            Err(_) => "Host Supervisor readiness timed out".to_string(),
+        };
+        return Err(host_supervisor_start_failure(
+            child,
+            pipe_name,
+            expected_pid,
+            expected_created_filetime,
+            Some(reader),
+            None,
+            detail,
+            &tail,
+        )
+        .await);
+    }
+    let (pid, created_filetime) = match parse_host_supervisor_ready_line(&line) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(host_supervisor_start_failure(
+                child,
+                pipe_name,
+                expected_pid,
+                expected_created_filetime,
+                Some(reader),
+                None,
+                error,
+                &tail,
+            )
+            .await);
+        }
+    };
+    if pid != expected_pid || created_filetime != expected_created_filetime {
+        return Err(host_supervisor_start_failure(
+            child,
+            pipe_name,
+            expected_pid,
+            expected_created_filetime,
+            Some(reader),
+            None,
+            "Host Supervisor readiness identity does not match its process handle".into(),
+            &tail,
+        )
+        .await);
+    }
+    let mut control = match child.stdin.take() {
+        Some(control) => control,
+        None => {
+            return Err(host_supervisor_start_failure(
+                child,
+                pipe_name,
+                expected_pid,
+                expected_created_filetime,
+                Some(reader),
+                None,
+                "Host Supervisor control stream is unavailable".into(),
+                &tail,
+            )
+            .await);
+        }
+    };
+    let register = format!(
+        "{{\"operation\":\"REGISTER_CONTROLLER\",\"pid\":{}}}\n",
+        std::process::id()
+    );
+    if let Err(error) = control.write_all(register.as_bytes()).await {
+        return Err(host_supervisor_start_failure(
+            child,
+            pipe_name,
+            pid,
+            created_filetime,
+            Some(reader),
+            Some(control),
+            format!("Could not register the Tauri Host Controller: {error}"),
+            &tail,
+        )
+        .await);
+    }
+    if let Err(error) = control.flush().await {
+        return Err(host_supervisor_start_failure(
+            child,
+            pipe_name,
+            pid,
+            created_filetime,
+            Some(reader),
+            Some(control),
+            format!("Could not confirm Tauri Host Controller registration: {error}"),
+            &tail,
+        )
+        .await);
+    }
+    let mut registered = String::new();
+    let acknowledgment =
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut registered)).await;
+    if !matches!(acknowledgment, Ok(Ok(length)) if length > 0)
+        || registered.trim_end_matches(['\r', '\n']) != "ATLAS_HOST_REGISTERED"
+    {
+        let detail = match acknowledgment {
+            Ok(Ok(_)) => "Host Supervisor did not acknowledge Tauri registration".to_string(),
+            Ok(Err(error)) => {
+                format!("Could not read Host Supervisor registration acknowledgment: {error}")
+            }
+            Err(_) => "Host Supervisor registration acknowledgment timed out".to_string(),
+        };
+        return Err(host_supervisor_start_failure(
+            child,
+            pipe_name,
+            pid,
+            created_filetime,
+            Some(reader),
+            Some(control),
+            detail,
+            &tail,
+        )
+        .await);
+    }
+    drain_host_supervisor_output(reader);
+    Ok(Some(HostSupervisorHandle {
+        child,
+        control: Some(control),
+        shutdown_attempted: false,
+        shutdown_sent: false,
+        pipe_name,
+        pid,
+        created_filetime,
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn process_creation_filetime(child: &tokio::process::Child) -> Result<u64, String> {
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetProcessTimes(
+            process: *mut std::ffi::c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| "Host Supervisor process handle is unavailable".to_string())?;
+    let mut creation = FileTime { low: 0, high: 0 };
+    let mut exit = FileTime { low: 0, high: 0 };
+    let mut kernel = FileTime { low: 0, high: 0 };
+    let mut user = FileTime { low: 0, high: 0 };
+    let ok = unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok((u64::from(creation.high) << 32) | u64::from(creation.low))
+}
+
+#[cfg(target_os = "windows")]
+async fn host_supervisor_start_failure(
+    mut child: tokio::process::Child,
+    pipe_name: String,
+    pid: u32,
+    created_filetime: u64,
+    output: Option<BufReader<tokio::process::ChildStdout>>,
+    control: Option<tokio::process::ChildStdin>,
+    detail: String,
+    tail: &StderrTail,
+) -> HostSupervisorStartError {
+    if let Some(output) = output {
+        drain_host_supervisor_output(output);
+    }
+    let kill_result = child.kill().await;
+    let (confirmed, cleanup_detail) = match kill_result {
+        Ok(()) => (true, String::new()),
+        Err(kill_error) => match child.try_wait() {
+            Ok(Some(_)) => (true, String::new()),
+            Ok(None) => (
+                false,
+                format!("Host Supervisor may still be running: {kill_error}"),
+            ),
+            Err(wait_error) => (
+                false,
+                format!(
+                    "Host Supervisor termination was not confirmed: {kill_error}; {wait_error}"
+                ),
+            ),
+        },
+    };
+    let stderr = String::from_utf8_lossy(&tail.lock().await)
+        .trim()
+        .to_string();
+    let mut full_detail = if stderr.is_empty() {
+        detail
+    } else {
+        format!("{detail}: {stderr}")
+    };
+    if confirmed {
+        HostSupervisorStartError {
+            detail: full_detail,
+            retained: None,
+        }
+    } else {
+        full_detail.push_str("; cleanup is unconfirmed: ");
+        full_detail.push_str(&cleanup_detail);
+        HostSupervisorStartError {
+            detail: full_detail,
+            retained: Some(HostSupervisorHandle {
+                control: control.or_else(|| child.stdin.take()),
+                child,
+                shutdown_attempted: false,
+                shutdown_sent: false,
+                pipe_name,
+                pid,
+                created_filetime,
+            }),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn drain_host_supervisor_output(mut output: BufReader<tokio::process::ChildStdout>) {
+    tauri::async_runtime::spawn(async move {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match output.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn start_host_supervisor(
+    _root: &std::path::Path,
+) -> Result<Option<HostSupervisorHandle>, HostSupervisorStartError> {
+    Ok(None)
 }
 
 /// Read whatever the stderr drainer has buffered so far.
@@ -1118,17 +2179,31 @@ fn add_cargo_bin_to_path(cmd: &mut tokio::process::Command) {
 async fn verify_openjarvis_rust_extension(
     root: &std::path::Path,
     uv_bin: &str,
+    use_uv: bool,
 ) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = if use_uv {
+        tokio::process::Command::new(uv_bin)
+    } else {
+        windows_python_command(root)?
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut cmd = tokio::process::Command::new(uv_bin);
-    cmd.args(["run", "python", "-c", "import openjarvis_rust"])
-        .stdout(std::process::Stdio::null())
+    if use_uv {
+        cmd.args(["run", "python", "-c", "import openjarvis_rust"]);
+    } else {
+        cmd.args(["-c", "import openjarvis_rust"]);
+    }
+    cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .current_dir(root);
     prepare_subprocess_for_appimage(&mut cmd);
     add_cargo_bin_to_path(&mut cmd);
-    cmd.kill_on_drop(true);
-
-    match cmd.output().await {
+    let output = match spawn_owned_child(&mut cmd) {
+        Ok(child) => child.wait_with_output().await,
+        Err(error) => Err(error),
+    };
+    match output {
         Ok(out) if out.status.success() => Ok(()),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1371,12 +2446,26 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     }
 
     let uv_bin = resolve_bin("uv");
+    let mut project_root = find_project_root();
+    let use_uv = std::path::Path::new(&uv_bin).exists() && uv_bin != "uv";
 
     // Verify uv is actually installed. Concrete per-OS instructions —
     // the generic "install it from astral.sh" was the #1 source of
     // confusion on the Discord support thread; users couldn't tell whether
     // to use winget, scoop, pip, or the official installer.
-    if !std::path::Path::new(&uv_bin).exists() && uv_bin == "uv" {
+    #[cfg(target_os = "windows")]
+    let existing_python_available = project_root
+        .as_ref()
+        .map(|root| {
+            root.join(".venv")
+                .join("Scripts")
+                .join("python.exe")
+                .is_file()
+        })
+        .unwrap_or(false);
+    #[cfg(not(target_os = "windows"))]
+    let existing_python_available = false;
+    if !use_uv && !existing_python_available {
         let mut s = status.lock().await;
         #[cfg(target_os = "windows")]
         let msg = "Could not find 'uv' (Python package manager). \
@@ -1401,8 +2490,6 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.error = Some(msg.into());
         return;
     }
-
-    let mut project_root = find_project_root();
 
     if project_root.is_none() {
         // Auto-clone on first launch
@@ -1644,46 +2731,73 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // to the user BEFORE the long server-start wait. The status detail
     // message also indicates this can take a couple of minutes on first
     // boot so users don't restart the app thinking it's stuck.
-    {
-        let mut s = status.lock().await;
-        s.detail = "Installing dependencies (uv sync — may take 1-2 min on first boot)...".into();
-    }
-    let mut sync_cmd = tokio::process::Command::new(&uv_bin);
-    // openjarvis_rust lives in a uv dependency group (not the published
-    // `desktop` extra) so pip installs from PyPI don't require it (#584).
-    sync_cmd
-        .args(DESKTOP_UV_SYNC_ARGS)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .current_dir(root);
-    // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455).
-    prepare_subprocess_for_appimage(&mut sync_cmd);
-    add_cargo_bin_to_path(&mut sync_cmd);
-    sync_cmd.kill_on_drop(true);
-    let sync_output = sync_cmd.output().await;
-    match sync_output {
-        Ok(out) if !out.status.success() => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+    if use_uv {
+        {
             let mut s = status.lock().await;
-            s.error = Some(format_uv_sync_failure(root, out.status.code(), &stderr));
-            return;
+            s.detail =
+                "Installing dependencies (uv sync — may take 1-2 min on first boot)...".into();
         }
-        Err(e) => {
-            let mut s = status.lock().await;
-            s.error = Some(format_uv_sync_spawn_error(root, &uv_bin, &e.to_string()));
-            return;
+        let mut sync_cmd = tokio::process::Command::new(&uv_bin);
+        // openjarvis_rust lives in a uv dependency group (not the published
+        // `desktop` extra) so pip installs from PyPI don't require it (#584).
+        sync_cmd
+            .args(DESKTOP_UV_SYNC_ARGS)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(root);
+        // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455).
+        prepare_subprocess_for_appimage(&mut sync_cmd);
+        add_cargo_bin_to_path(&mut sync_cmd);
+        let sync_output = match spawn_owned_child(&mut sync_cmd) {
+            Ok(child) => child.wait_with_output().await,
+            Err(error) => Err(error),
+        };
+        match sync_output {
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let mut s = status.lock().await;
+                s.error = Some(format_uv_sync_failure(root, out.status.code(), &stderr));
+                return;
+            }
+            Err(e) => {
+                let mut s = status.lock().await;
+                s.error = Some(format_uv_sync_spawn_error(root, &uv_bin, &e.to_string()));
+                return;
+            }
+            Ok(_) => {} // success — fall through
         }
-        Ok(_) => {} // success — fall through
+    } else {
+        status.lock().await.detail =
+            "Using the existing Windows Python environment (uv is not installed).".into();
     }
 
     {
         let mut s = status.lock().await;
         s.detail = "Verifying Rust extension (openjarvis_rust)...".into();
     }
-    if let Err(err) = verify_openjarvis_rust_extension(root, &uv_bin).await {
+    if let Err(err) = verify_openjarvis_rust_extension(root, &uv_bin, use_uv).await {
         let mut s = status.lock().await;
         s.error = Some(err);
         return;
+    }
+
+    let host_supervisor = match start_host_supervisor(root).await {
+        Ok(host_supervisor) => host_supervisor,
+        Err(failure) => {
+            if let Some(host_supervisor) = failure.retained {
+                backend.lock().await.host_supervisor = Some(host_supervisor);
+                status.lock().await.mark_stop_unconfirmed(failure.detail);
+            } else {
+                status.lock().await.error = Some(failure.detail);
+            }
+            return;
+        }
+    };
+    let host_bootstrap_args = host_supervisor
+        .as_ref()
+        .map(|host| (host.pipe_name.clone(), host.pid, host.created_filetime));
+    if let Some(host_supervisor) = host_supervisor {
+        backend.lock().await.host_supervisor = Some(host_supervisor);
     }
 
     {
@@ -1691,14 +2805,27 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.detail = format!("Starting API server from {}...", root.display());
     }
 
-    let mut cmd = tokio::process::Command::new(&uv_bin);
-    let mut serve_argv: Vec<String> = vec![
-        "run".into(),
-        "jarvis".into(),
+    let mut serve_argv: Vec<String> = Vec::new();
+    #[cfg(target_os = "windows")]
+    serve_argv.extend([
+        "-m".into(),
+        "openjarvis.cli".into(),
+        "--quiet".into(),
         "serve".into(),
-        "--port".into(),
-        JARVIS_PORT.to_string(),
-    ];
+    ]);
+    #[cfg(not(target_os = "windows"))]
+    serve_argv.extend(["run".into(), "jarvis".into(), "serve".into()]);
+    serve_argv.extend(["--port".into(), JARVIS_PORT.to_string()]);
+    if let Some((pipe_name, supervisor_pid, created_filetime)) = host_bootstrap_args {
+        serve_argv.extend([
+            "--host-bootstrap-pipe".into(),
+            pipe_name,
+            "--host-supervisor-pid".into(),
+            supervisor_pid.to_string(),
+            "--host-supervisor-created-filetime".into(),
+            created_filetime.to_string(),
+        ]);
+    }
     serve_argv.extend(plan.serve_args.iter().cloned());
     // If the Ollama pull fell back to a different tag than planned, serve the
     // tag that is actually present. boot_plan always emits `--model` followed
@@ -1713,46 +2840,22 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
             ),
         }
     }
-    cmd.args(&serve_argv)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .current_dir(root);
-    // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455) —
-    // do this BEFORE cmd.env() calls below so our explicit cloud-key env
-    // additions aren't accidentally stripped.
-    prepare_subprocess_for_appimage(&mut cmd);
-
-    // Inject cloud API keys from secure desktop storage.
-    for (key, value) in cloud_keys_for_inference(&cfg) {
-        cmd.env(&key, &value);
-    }
-    let jarvis_child = spawn_owned_child(&mut cmd);
-
-    match jarvis_child {
-        Ok(mut child) => {
-            // Start draining stderr immediately. If we wait until the
-            // health check returns we risk filling the 4 KB Windows pipe
-            // buffer during startup logging and hanging the child before
-            // it can bind its HTTP port — exactly the symptom in #309.
-            let stderr_handle = child.stderr.take();
-            let mut mgr = backend.lock().await;
-            let tail = mgr.jarvis_stderr_tail.clone();
-            mgr.jarvis = Some(ChildHandle::new(child));
-            drop(mgr);
-            if let Some(stderr) = stderr_handle {
-                spawn_jarvis_stderr_drainer(stderr, tail);
-            }
-        }
-        Err(e) => {
-            let mut s = status.lock().await;
-            s.error = Some(format!(
-                "Could not start jarvis server: {}. \
-                 Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
-                e,
-                root.display(),
-            ));
-            return;
-        }
+    let launch = ControllerLaunchSpec {
+        root: root.to_path_buf(),
+        #[cfg(not(target_os = "windows"))]
+        uv_bin: uv_bin.clone(),
+        serve_argv: serve_argv.clone(),
+        inference: cfg.clone(),
+    };
+    if let Err(error) = spawn_controller(&backend, &launch, &cfg).await {
+        let mut s = status.lock().await;
+        s.error = Some(format!(
+            "Could not start jarvis server: {}. \
+             Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
+            error,
+            root.display(),
+        ));
+        return;
     }
 
     let server_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
@@ -1833,6 +2936,9 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         s.error = Some(format!("Could not confirm inference setup: {}", err));
         return;
     }
+    if let Some(launch) = backend.lock().await.controller_launch.as_mut() {
+        launch.inference = cfg.clone();
+    }
 
     {
         let mut s = status.lock().await;
@@ -1851,6 +2957,196 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     // `pull_model` command invoked from the UI).
 }
 
+fn argument_matches(args: &[String], name: &str, value: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == name && pair[1] == value)
+}
+
+async fn prepare_controller_recovery(
+    backend: &SharedBackend,
+) -> Result<ControllerLaunchSpec, String> {
+    let mut manager = backend.lock().await;
+    if manager.untracked_child_unconfirmed {
+        return Err("A startup child is untracked; Controller recovery is unsafe.".into());
+    }
+    if let Some(controller) = manager.jarvis.as_mut() {
+        match controller.child.try_wait() {
+            Ok(Some(_)) => manager.jarvis = None,
+            Ok(None) => return Err("The previous Controller is still running.".into()),
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the previous Controller exit: {error}"
+                ))
+            }
+        }
+    }
+
+    let launch = manager.controller_launch.clone().ok_or_else(|| {
+        "Controller launch details are unavailable; stop and start the backend.".to_string()
+    })?;
+
+    if let Some(host) = manager.host_supervisor.as_mut() {
+        if host.shutdown_attempted || host.shutdown_sent || host.child.id() != Some(host.pid) {
+            return Err(
+                "The existing Host Supervisor is shutting down or has an invalid identity.".into(),
+            );
+        }
+        match host.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err("The existing Host Supervisor has exited.".into()),
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the Host Supervisor is running: {error}"
+                ))
+            }
+        }
+        #[cfg(target_os = "windows")]
+        if process_creation_filetime(&host.child)? != host.created_filetime {
+            return Err("The existing Host Supervisor creation time changed.".into());
+        }
+        if !argument_matches(&launch.serve_argv, "--host-bootstrap-pipe", &host.pipe_name)
+            || !argument_matches(
+                &launch.serve_argv,
+                "--host-supervisor-pid",
+                &host.pid.to_string(),
+            )
+            || !argument_matches(
+                &launch.serve_argv,
+                "--host-supervisor-created-filetime",
+                &host.created_filetime.to_string(),
+            )
+        {
+            return Err(
+                "Controller launch details do not match the existing Host Supervisor.".into(),
+            );
+        }
+    }
+
+    if let Some(ollama) = manager.ollama.as_mut() {
+        match ollama.child.try_wait() {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return Err("The managed inference engine has exited; restart the backend.".into())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not confirm the inference engine is running: {error}"
+                ))
+            }
+        }
+    }
+    Ok(launch)
+}
+
+async fn mark_controller_recovery_failure(
+    backend: &SharedBackend,
+    status: &SharedStatus,
+    error: String,
+    retry_if_exited: bool,
+) {
+    let can_retry = if retry_if_exited {
+        let mut manager = backend.lock().await;
+        match manager.jarvis.as_mut() {
+            Some(controller) => matches!(controller.child.try_wait(), Ok(Some(_))),
+            None => true,
+        }
+    } else {
+        false
+    };
+    let mut status = status.lock().await;
+    status.phase = if can_retry {
+        "controller_exited".into()
+    } else {
+        "recovery_failed".into()
+    };
+    status.server_ready = false;
+    status.detail = error.clone();
+    status.error = Some(error);
+}
+
+async fn recover_controller(backend: SharedBackend, status: SharedStatus) {
+    let launch = match prepare_controller_recovery(&backend).await {
+        Ok(launch) => launch,
+        Err(error) => {
+            mark_controller_recovery_failure(&backend, &status, error, false).await;
+            return;
+        }
+    };
+    let Some(cfg) = read_configured_inference_config() else {
+        mark_controller_recovery_failure(
+            &backend,
+            &status,
+            "Saved inference source is unavailable; choose a source before restarting.".into(),
+            false,
+        )
+        .await;
+        return;
+    };
+    if cfg != launch.inference {
+        mark_controller_recovery_failure(
+            &backend,
+            &status,
+            "Saved inference source changed since Controller A started; stop and start the backend to apply it.".into(),
+            false,
+        )
+        .await;
+        return;
+    }
+    {
+        let mut status = status.lock().await;
+        status.phase = "server".into();
+        status.detail = "Restarting Controller...".into();
+        status.error = None;
+    }
+    if let Err(error) = spawn_controller(&backend, &launch, &cfg).await {
+        mark_controller_recovery_failure(&backend, &status, error, true).await;
+        return;
+    }
+
+    let server_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
+    match wait_for_jarvis_health(&server_url, Duration::from_secs(600), &backend).await {
+        JarvisStartResult::Ready => {
+            let mut status = status.lock().await;
+            status.server_ready = true;
+            status.phase = "ready".into();
+            status.detail = "Controller restarted; API server is ready.".into();
+            status.error = None;
+        }
+        JarvisStartResult::EarlyExit { code, stderr } => {
+            let code = code
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let error = if stderr.is_empty() {
+                format!("Restarted Controller exited before becoming ready (code {code}).")
+            } else {
+                format!("Restarted Controller exited before becoming ready (code {code}).\n\nStderr:\n{stderr}")
+            };
+            mark_controller_recovery_failure(&backend, &status, error, true).await;
+        }
+        JarvisStartResult::ServiceUnavailable(body) => {
+            mark_controller_recovery_failure(
+                &backend,
+                &status,
+                format!(
+                    "Restarted Controller is running but unhealthy (HTTP 503): {}",
+                    body.trim()
+                ),
+                false,
+            )
+            .await;
+        }
+        JarvisStartResult::Timeout => {
+            let stderr = read_jarvis_stderr_tail(&backend).await;
+            let detail = if stderr.is_empty() {
+                "Restarted Controller did not become healthy within 10 minutes.".into()
+            } else {
+                format!("Restarted Controller did not become healthy within 10 minutes.\n\nStderr:\n{stderr}")
+            };
+            mark_controller_recovery_failure(&backend, &status, detail, false).await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -1860,8 +3156,14 @@ fn api_base() -> String {
 }
 
 #[tauri::command]
-async fn get_setup_status(state: tauri::State<'_, SharedStatus>) -> Result<SetupStatus, String> {
-    Ok(state.lock().await.clone())
+async fn get_setup_status(
+    backend: tauri::State<'_, SharedBackend>,
+    state: tauri::State<'_, SharedStatus>,
+) -> Result<SetupStatus, String> {
+    let mut manager = backend.lock().await;
+    let mut status = state.lock().await;
+    observe_managed_controller_exit(&mut manager, &mut status);
+    Ok(status.clone())
 }
 
 #[tauri::command]
@@ -2093,89 +3395,52 @@ async fn fetch_models(api_url: String) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
+    let project_root = find_project_root();
+    #[cfg(not(target_os = "windows"))]
     let uv_bin = resolve_bin("uv");
 
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let root = project_root
+            .as_ref()
+            .ok_or_else(|| "OpenJarvis project root is unavailable".to_string())?;
+        windows_python_command(root)?
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = tokio::process::Command::new(&uv_bin);
+
+    #[cfg(target_os = "windows")]
+    let mut cmd_args = vec!["-m".to_string(), "openjarvis.cli".to_string()];
+    #[cfg(not(target_os = "windows"))]
     let mut cmd_args = vec!["run".to_string(), "jarvis".to_string()];
     cmd_args.extend(args.iter().cloned());
 
-    let mut cmd = tokio::process::Command::new(&uv_bin);
     cmd.args(&cmd_args);
     // Run from the project root so `uv run jarvis` resolves the OpenJarvis
     // project regardless of the app's launch cwd. In a packaged install the
     // cwd isn't the checkout, so without this `jarvis` isn't found and the
     // backend never starts — the UI then shows "Failed to get response"
     // (see #531).
-    if let Some(ref root) = find_project_root() {
+    if let Some(ref root) = project_root {
         cmd.current_dir(root);
     }
 
     let is_serve = args.first().map(|a| a.as_str() == "serve").unwrap_or(false);
 
-    if !is_serve {
-        // Short-lived command (e.g. `stop`, `status`): wait for it and return
-        // its captured output.
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to launch jarvis: {}", e))?;
-        return if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        };
+    if is_serve {
+        return Err("Use the managed Start action to launch the Jarvis server.".into());
     }
 
-    // `jarvis serve` is a long-running server that never exits. The old code
-    // used `.output()`, which waits for the process to exit and so hung this
-    // command forever — the "Start" button never resolved (#531). Spawn it
-    // detached instead, drain stderr (a full 4 KB Windows pipe can otherwise
-    // stall the child mid-startup, #309), and poll /health for readiness.
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to launch jarvis serve: {}", e))?;
-
-    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        spawn_jarvis_stderr_drainer(stderr, tail.clone());
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-    let url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-
-    loop {
-        // Surface an early crash (bad venv, missing Rust ext, etc.) right away
-        // instead of waiting out the full readiness timeout.
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = String::from_utf8_lossy(tail.lock().await.as_slice()).into_owned();
-            return Err(format!(
-                "jarvis serve exited (code {:?}) before becoming healthy:\n{}",
-                status.code(),
-                stderr.trim()
-            ));
-        }
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                // Leave the server running (the Child is detached on drop —
-                // kill_on_drop defaults to false); `stop` tears it down.
-                return Ok(format!(
-                    "jarvis serve is ready on http://127.0.0.1:{}",
-                    JARVIS_PORT
-                ));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "jarvis serve did not become healthy on port {} within 120s.",
-                JARVIS_PORT
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut cmd = cmd;
+    let output = spawn_owned_child(&mut cmd)
+        .map_err(|e| format!("Failed to launch jarvis: {e}"))?
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Failed while waiting for jarvis: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
 
@@ -2666,7 +3931,7 @@ impl Default for SourceKind {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 struct InferenceConfig {
     #[serde(default)]
     kind: SourceKind,
@@ -3448,6 +4713,9 @@ async fn hide_overlay() -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "windows")]
+    initialize_process_job();
+
     let backend: SharedBackend = Arc::new(Mutex::new(BackendManager::default()));
     let exit_state = Arc::new(AtomicU8::new(EXIT_IDLE));
     let configured_at_launch = match read_configured_inference_config() {
@@ -3494,6 +4762,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
                 let _ = window.set_focus();
             }
         }))
@@ -3564,8 +4834,7 @@ pub fn run() {
             // explicit consent and invokes `start_backend`.
             if configured_at_launch.is_some() {
                 tauri::async_runtime::spawn(async move {
-                    if let Err(error) =
-                        start_managed_boot(boot_backend_ref, boot_status_ref).await
+                    if let Err(error) = start_managed_boot(boot_backend_ref, boot_status_ref).await
                     {
                         eprintln!("Could not safely start the managed backend: {error}");
                     }
@@ -3615,6 +4884,8 @@ pub fn run() {
                     ExitRequestAction::Prevent => api.prevent_exit(),
                     ExitRequestAction::StartCleanup => {
                         api.prevent_exit();
+                        #[cfg(target_os = "windows")]
+                        mark_process_job_exiting();
                         let app = app.clone();
                         let backend = backend.clone();
                         let status = status.clone();
@@ -3625,6 +4896,15 @@ pub fn run() {
                                 exit_state.store(EXIT_IDLE, Ordering::Release);
                                 eprintln!(
                                     "Backend shutdown could not be confirmed during exit: {error}"
+                                );
+                                return;
+                            }
+                            #[cfg(target_os = "windows")]
+                            if let Err(error) = close_process_job() {
+                                status.lock().await.mark_stop_unconfirmed(error.clone());
+                                exit_state.store(EXIT_IDLE, Ordering::Release);
+                                eprintln!(
+                                    "Tauri Job Object shutdown could not be confirmed: {error}"
                                 );
                                 return;
                             }
@@ -3643,28 +4923,410 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::WindowsProcessJob;
     use super::{
-        boot_plan, default_local_model, discard_pending_inference_setup_at,
-        exit_request_action,
+        boot_plan, default_local_model, discard_pending_inference_setup_at, exit_request_action,
         format_extension_import_failure, format_missing_rust_toolchain, format_port_unavailable,
-        format_uv_sync_failure, format_uv_sync_spawn_error, managed_cloud_key_names,
-        matching_installed_model, model_names_match, normalize_host,
-        parse_configured_inference_config, parse_ollama_model_names,
+        format_uv_sync_failure, format_uv_sync_spawn_error, has_in_progress_boot,
+        managed_cloud_key_names, matching_installed_model, model_names_match, normalize_host,
+        parse_configured_inference_config, parse_host_supervisor_config,
+        parse_host_supervisor_ready_line, parse_ollama_model_names,
         persist_confirmed_inference_config_at, preferred_installed_model,
         project_root_near_executable, reload_cloud_keys_for_owned_backend_at,
         should_persist_resolved_model, spawn_owned_child, stage_pending_inference_config_at,
-        startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, BackendManager,
-        InferenceConfig, InferenceCredentialStore, PendingInferenceRollback, SetupStatus,
-        SourceKind, DESKTOP_UV_SYNC_ARGS, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
-        AtomicU8, ExitRequestAction, Ordering, EXIT_IDLE, EXIT_STOPPED, EXIT_STOPPING,
+        startup_installed_model, stop_all_then, upsert_engine_host, uv_sync_stderr_tail, AtomicU8,
+        BackendManager, ChildHandle, ExitRequestAction, HostSupervisorHandle, InferenceConfig,
+        InferenceCredentialStore, Mutex, Ordering, PendingInferenceRollback, SetupStatus,
+        SourceKind, DESKTOP_UV_SYNC_ARGS, DESKTOP_UV_SYNC_COMMAND, EXIT_IDLE, EXIT_STOPPED,
+        EXIT_STOPPING, PENDING_INFERENCE_API_KEY,
     };
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     #[test]
     fn atlas_cloud_key_is_loaded_with_managed_desktop_keys() {
         assert!(managed_cloud_key_names().contains(&"ATLASCLOUD_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn host_supervisor_readiness_pins_a_well_formed_os_identity() {
+        assert_eq!(
+            parse_host_supervisor_ready_line("ATLAS_HOST_READY:42:132563148000000000\r\n"),
+            Ok((42, 132563148000000000))
+        );
+        assert!(parse_host_supervisor_ready_line("ATLAS_HOST_READY:0:123").is_err());
+        assert!(parse_host_supervisor_ready_line("ATLAS_HOST_READY:42:0").is_err());
+        assert!(parse_host_supervisor_ready_line("ATLAS_HOST_READY:42:123:extra").is_err());
+    }
+
+    #[test]
+    fn host_supervisor_shutdown_helper() {
+        let Ok(exit_code) = std::env::var("OPENJARVIS_HOST_SUPERVISOR_TEST_EXIT") else {
+            return;
+        };
+        let mut request = String::new();
+        let mut stdin = std::io::stdin().lock();
+        std::io::BufRead::read_line(&mut stdin, &mut request).unwrap();
+        assert_eq!(request, "{\"operation\":\"SHUTDOWN\"}\n");
+        let exit_code = exit_code.parse::<i32>().unwrap();
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+    }
+
+    #[test]
+    fn controller_exit_fixture() {
+        let Ok(code) = std::env::var("ATLAS_CONTROLLER_EXIT_FIXTURE") else {
+            return;
+        };
+        std::process::exit(code.parse::<i32>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ready_status_exposes_a_confirmed_controller_exit_for_retry() {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::controller_exit_fixture", "--nocapture"])
+            .env("ATLAS_CONTROLLER_EXIT_FIXTURE", "23")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = super::spawn_owned_child(&mut command).unwrap();
+        let mut manager = super::BackendManager::default();
+        manager.jarvis = Some(super::ChildHandle::new(child));
+        let mut status = super::SetupStatus {
+            phase: "ready".into(),
+            server_ready: true,
+            ..Default::default()
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let exited = manager
+                .jarvis
+                .as_mut()
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some();
+            if exited {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fixture did not exit"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        super::observe_managed_controller_exit(&mut manager, &mut status);
+        assert_eq!(status.phase, "controller_exited");
+        assert!(!status.server_ready);
+        assert!(status.error.as_deref().unwrap().contains("code 23"));
+    }
+
+    #[test]
+    fn host_supervisor_config_defaults_on_and_respects_explicit_disable() {
+        assert_eq!(parse_host_supervisor_config(""), Ok(true));
+        assert_eq!(
+            parse_host_supervisor_config("[agent_manager]\nenabled = false\n"),
+            Ok(false)
+        );
+        assert!(parse_host_supervisor_config("[agent_manager]\nenabled = 0\n").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_job_child_fixture() {
+        let Ok(mode) = std::env::var("ATLAS_JOB_CHILD_MODE") else {
+            return;
+        };
+        let sentinel = std::env::var_os("ATLAS_JOB_CHILD_SENTINEL").unwrap();
+        std::fs::write(sentinel, mode.as_bytes()).unwrap();
+        if mode == "root" {
+            let child_sentinel = std::env::var_os("ATLAS_JOB_DESCENDANT_SENTINEL").unwrap();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::windows_job_child_fixture", "--nocapture"])
+                .env("ATLAS_JOB_CHILD_MODE", "descendant")
+                .env("ATLAS_JOB_CHILD_SENTINEL", child_sentinel)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn process_creation_filetime_reads_live_child_handle() {
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::windows_job_child_fixture", "--nocapture"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let creation = super::process_creation_filetime(&child).unwrap();
+        assert_ne!(creation, 0);
+        let _ = child.wait().await.unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_job_production_spawn_helper() {
+        if std::env::var_os("ATLAS_JOB_PRODUCTION_HELPER").is_none() {
+            return;
+        }
+
+        let job = super::process_job().unwrap();
+        assert_eq!(job.active_processes().unwrap(), 0);
+        let working_dir = std::env::current_dir().unwrap();
+        let root = working_dir
+            .ancestors()
+            .find(|path| path.join("pyproject.toml").is_file())
+            .expect("test working directory has no OpenJarvis project root");
+        let mut command = super::windows_python_command(root).unwrap();
+        command
+            .args(["-c", "import os, openjarvis_rust; print(os.getpid())"])
+            .current_dir(root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = spawn_owned_child(&mut command).unwrap();
+        let expected_pid = child.id().unwrap();
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "native extension import failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let python_pid = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(
+            python_pid, expected_pid,
+            "Python ran in an untracked child PID"
+        );
+        assert_eq!(job.active_processes().unwrap(), 0);
+        job.close().unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_job_contains_production_spawn_during_native_import() {
+        let mut helper = tokio::process::Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([
+                "--exact",
+                "tests::windows_job_production_spawn_helper",
+                "--nocapture",
+            ])
+            .env("ATLAS_JOB_PRODUCTION_HELPER", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            helper.spawn().unwrap().wait_with_output(),
+        )
+        .await
+        .expect("job-contained native import timed out")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "job-contained native import helper failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_job_host_supervisor_identity_and_shutdown_helper() {
+        if std::env::var_os("ATLAS_HOST_SUPERVISOR_JOB_HELPER").is_none() {
+            return;
+        }
+
+        let job = super::process_job().unwrap();
+        let working_dir = std::env::current_dir().unwrap();
+        let root = working_dir
+            .ancestors()
+            .find(|path| path.join("pyproject.toml").is_file())
+            .expect("test working directory has no OpenJarvis project root");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_home = std::env::temp_dir().join(format!(
+            "atlas-tauri-host-supervisor-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            config_home.join("config.toml"),
+            "[agent_manager]\nenabled = true\n",
+        )
+        .unwrap();
+        std::env::set_var("OPENJARVIS_HOME", &config_home);
+
+        let mut supervisor = match super::start_host_supervisor(root).await {
+            Ok(Some(supervisor)) => supervisor,
+            Ok(None) => panic!("Host Supervisor should be enabled"),
+            Err(mut error) => {
+                if let Some(mut retained) = error.retained.take() {
+                    if let Err(cleanup_error) = retained.stop().await {
+                        panic!(
+                            "Host Supervisor startup failed: {}; cleanup failed: {cleanup_error}",
+                            error.detail
+                        );
+                    }
+                }
+                panic!("Host Supervisor startup failed: {}", error.detail);
+            }
+        };
+        assert_eq!(supervisor.pid, supervisor.child.id().unwrap());
+        assert_eq!(
+            supervisor.created_filetime,
+            super::process_creation_filetime(&supervisor.child).unwrap()
+        );
+        supervisor.stop().await.unwrap();
+        assert_eq!(job.active_processes().unwrap(), 0);
+        job.close().unwrap();
+        std::fs::remove_dir_all(config_home).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_job_starts_and_stops_host_supervisor_with_pinned_pid() {
+        let mut helper = tokio::process::Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([
+                "--exact",
+                "tests::windows_job_host_supervisor_identity_and_shutdown_helper",
+                "--nocapture",
+            ])
+            .env("ATLAS_HOST_SUPERVISOR_JOB_HELPER", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            helper.spawn().unwrap().wait_with_output(),
+        )
+        .await
+        .expect("Host Supervisor lifecycle test timed out")
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "Host Supervisor lifecycle helper failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn windows_job_contains_suspended_child_and_descendant() {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        let job = WindowsProcessJob::new().unwrap();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root_sentinel =
+            std::env::temp_dir().join(format!("atlas-job-{}-{suffix}-root", std::process::id()));
+        let descendant_sentinel = std::env::temp_dir().join(format!(
+            "atlas-job-{}-{suffix}-descendant",
+            std::process::id()
+        ));
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "tests::windows_job_child_fixture", "--nocapture"])
+            .env("ATLAS_JOB_CHILD_MODE", "root")
+            .env("ATLAS_JOB_CHILD_SENTINEL", &root_sentinel)
+            .env("ATLAS_JOB_DESCENDANT_SENTINEL", &descendant_sentinel)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        let mut child = command.spawn().unwrap();
+        assert!(!root_sentinel.exists(), "child ran before job assignment");
+        assert_eq!(job.active_processes().unwrap(), 0);
+        job.assign_and_resume(&child).unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if root_sentinel.exists()
+                && descendant_sentinel.exists()
+                && job.active_processes().unwrap() >= 2
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "job child did not start"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        job.terminate_all().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.active_processes().unwrap(), 0);
+        job.close().unwrap();
+        let _ = std::fs::remove_file(root_sentinel);
+        let _ = std::fs::remove_file(descendant_sentinel);
+    }
+
+    async fn spawn_host_supervisor_test_child(exit_code: i32) -> HostSupervisorHandle {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "tests::host_supervisor_shutdown_helper",
+                "--nocapture",
+            ])
+            .env(
+                "OPENJARVIS_HOST_SUPERVISOR_TEST_EXIT",
+                exit_code.to_string(),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = spawn_owned_child(&mut command).unwrap();
+        let control = child.stdin.take().unwrap();
+        HostSupervisorHandle {
+            child,
+            control: Some(control),
+            shutdown_attempted: false,
+            shutdown_sent: false,
+            pipe_name: "test-pipe".into(),
+            pid: 1,
+            created_filetime: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_supervisor_shutdown_is_confirmed_only_after_successful_exit() {
+        let mut manager = BackendManager::default();
+        manager.host_supervisor = Some(spawn_host_supervisor_test_child(0).await);
+        manager.stop_all().await.unwrap();
+        assert!(manager.host_supervisor.is_none());
+
+        manager.host_supervisor = Some(spawn_host_supervisor_test_child(7).await);
+        let error = manager.stop_all().await.unwrap_err();
+        assert!(error.contains("cleanup is unconfirmed"));
+        assert!(manager.host_supervisor.is_some());
     }
 
     #[derive(Default)]
@@ -4539,13 +6201,14 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    async fn spawn_owned_child_helper(
-        started: &Path,
-        completed: &Path,
-    ) -> tokio::process::Child {
+    async fn spawn_owned_child_helper(started: &Path, completed: &Path) -> tokio::process::Child {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", "tests::owned_child_process_helper", "--nocapture"])
+            .args([
+                "--exact",
+                "tests::owned_child_process_helper",
+                "--nocapture",
+            ])
             .env("OPENJARVIS_OWNED_CHILD_STARTED", started)
             .env("OPENJARVIS_OWNED_CHILD_COMPLETED", completed)
             .env("OPENJARVIS_OWNED_CHILD_SLEEP_MS", "30000")
@@ -4583,9 +6246,22 @@ mod tests {
         let error = manager.stop_all().await.unwrap_err();
 
         assert!(error.contains("injected child stop failure"));
-        assert!(manager.jarvis.is_some(), "failed child ownership must be retained");
-        assert!(manager.ollama.is_none(), "other children should still be stopped");
-        assert!(manager.jarvis.as_mut().unwrap().child.try_wait().unwrap().is_none());
+        assert!(
+            manager.jarvis.is_some(),
+            "failed child ownership must be retained"
+        );
+        assert!(
+            manager.ollama.is_none(),
+            "other children should still be stopped"
+        );
+        assert!(manager
+            .jarvis
+            .as_mut()
+            .unwrap()
+            .child
+            .try_wait()
+            .unwrap()
+            .is_none());
 
         manager.jarvis.as_mut().unwrap().fail_kill = false;
         manager.stop_all().await.unwrap();
@@ -4613,6 +6289,40 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_exit_requests_start_cleanup_once_and_block_reentry() {
+        const CALLERS: usize = 32;
+        let state = Arc::new(AtomicU8::new(EXIT_IDLE));
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS + 1));
+        let requests = (0..CALLERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    exit_request_action(&state)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let mut cleanup_starts = 0;
+        let mut prevented = 0;
+        for request in requests {
+            match request.join().expect("exit request thread should complete") {
+                ExitRequestAction::StartCleanup => cleanup_starts += 1,
+                ExitRequestAction::Prevent => prevented += 1,
+                ExitRequestAction::Allow => panic!("exit must wait for cleanup"),
+            }
+        }
+        assert_eq!(cleanup_starts, 1);
+        assert_eq!(prevented, CALLERS - 1);
+        assert_eq!(state.load(Ordering::Acquire), EXIT_STOPPING);
+
+        state.store(EXIT_STOPPED, Ordering::Release);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::Allow);
+    }
+
+    #[test]
     fn stop_unconfirmed_status_preserves_last_known_readiness() {
         let config = InferenceConfig::default();
         let mut status = SetupStatus::starting(&config);
@@ -4621,7 +6331,10 @@ mod tests {
         status.mark_stop_unconfirmed("child termination failed".into());
 
         assert_eq!(status.phase, "stop_unconfirmed");
-        assert!(status.server_ready, "failure must not claim the backend stopped");
+        assert!(
+            status.server_ready,
+            "failure must not claim the backend stopped"
+        );
         assert_eq!(status.error.as_deref(), Some("child termination failed"));
     }
 

@@ -57,6 +57,47 @@ def test_sessionless_synthetic_tool_checkpoint_needs_no_session_leases(tmp_path)
         manager.close()
 
 
+@pytest.mark.parametrize("tool_name", ["browser_navigate", "windows_action"])
+def test_session_tool_checkpoint_requires_its_host_lease(tmp_path, tool_name):
+    manager = AgentManager(str(tmp_path / f"{tool_name}.db"))
+    try:
+        agent = manager.create_agent("owner")
+        task = manager.create_task(agent["id"], "session task")
+        authority = TestPrincipalAuthority(b"session-checkpoint-authority")
+        principal = authority.verify(authority.issue("principal"))
+        token = "s" * 32
+        started = manager.start_task(
+            task["id"],
+            agent["id"],
+            principal.principal_id,
+            None,
+            worker_token=token,
+        )
+        checkpoint = manager.save_checkpoint(
+            agent["id"],
+            "session",
+            {
+                "task_id": task["id"],
+                "messages": [{"role": "tool", "name": tool_name, "content": "result"}],
+            },
+            {"execution_id": started["execution_attempt"], "worker_epoch": 1},
+        )
+        with pytest.raises(PermissionError, match="binding mismatch"):
+            manager.bind_task_checkpoint(
+                task["id"],
+                agent["id"],
+                principal,
+                authority,
+                checkpoint["id"],
+                started["execution_attempt"],
+                integrity_key=b"session-checkpoint-integrity-key",
+                worker_token=token,
+                worker_epoch=1,
+            )
+    finally:
+        manager.close()
+
+
 def test_task_checkpoint_binding_revalidates_identity_and_integrity(tmp_path):
     path = str(tmp_path / "tasks.db")
     manager = AgentManager(path)

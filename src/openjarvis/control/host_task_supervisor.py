@@ -210,6 +210,7 @@ class HostTaskSupervisorProcess:
         self._worker_stopped = False
         self._exit_record: dict[str, Any] | None = None
         self._evidence: dict[str, Any] = {}
+        self._verified_exit_evidence: dict[str, Any] | None = None
         self._worker_handle: Any = None
         self._job_handle: Any = None
         self._creation_time: int | None = None
@@ -741,6 +742,14 @@ class HostTaskSupervisorProcess:
                         first_error = exc
             if first_error is not None:
                 raise first_error
+            self._verified_exit_evidence = None
+            worker_exit_code = self._evidence.get("worker_exit_code")
+            if (
+                self._process.returncode == 0
+                and type(worker_exit_code) is int
+                and self._os_exit_verified(worker_exit_code)
+            ):
+                self._verified_exit_evidence = dict(self._evidence)
             self.release_exit_evidence()
             self._home.cleanup()
             self._closed = True
@@ -754,26 +763,35 @@ class HostTaskSupervisorProcess:
 
     def verify_exit_evidence(self, evidence: Mapping[str, Any]) -> bool:
         """Verify evidence received on the owned channel and the supervisor handle."""
+        if not isinstance(evidence, Mapping):
+            return False
         try:
-            os_verified = self._os_exit_verified(evidence["worker_exit_code"])
+            candidate = dict(evidence)
+            if self._worker_handle and self._job_handle:
+                os_verified = self._os_exit_verified(candidate["worker_exit_code"])
+            else:
+                os_verified = (
+                    self._closed
+                    and self._process.returncode == 0
+                    and getattr(self, "_verified_exit_evidence", None) == candidate
+                )
         except Exception:
-            os_verified = False
+            return False
         return (
             (
                 (self._closed and self._process.returncode == 0)
                 or (self._worker_stopped and self._process.poll() is None)
             )
             and os_verified
-            and isinstance(evidence, Mapping)
-            and dict(evidence) == self._evidence
-            and evidence.get("controller_pid") == self.pid
-            and evidence.get("worker_pid") == self._worker_pid
-            and evidence.get("supervisor_id") == self.binding["supervisor_id"]
-            and evidence.get("worker_instance_id") == self.binding["worker_id"]
-            and evidence.get("job_exit_confirmed") is True
-            and evidence.get("process_wait_confirmed") is True
-            and type(evidence.get("worker_exit_code")) is int
-            and type(evidence.get("worker_forced_termination")) is bool
+            and candidate == self._evidence
+            and candidate.get("controller_pid") == self.pid
+            and candidate.get("worker_pid") == self._worker_pid
+            and candidate.get("supervisor_id") == self.binding["supervisor_id"]
+            and candidate.get("worker_instance_id") == self.binding["worker_id"]
+            and candidate.get("job_exit_confirmed") is True
+            and candidate.get("process_wait_confirmed") is True
+            and type(candidate.get("worker_exit_code")) is int
+            and type(candidate.get("worker_forced_termination")) is bool
         )
 
     def _abort(self) -> None:
