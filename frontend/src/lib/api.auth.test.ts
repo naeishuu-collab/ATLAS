@@ -90,6 +90,51 @@ describe('authHeaders', () => {
   });
 });
 
+describe('managed-agent task endpoints', () => {
+  it('creates a task with its required synthetic tool', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: 'task-1', status: 'pending' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    const { createAgentTask } = await freshApi();
+
+    await createAgentTask('agent-1', 'Echo a test value', ['synthetic_echo']);
+
+    expect(fetchMock).toHaveBeenCalledWith('/v1/managed-agents/agent-1/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: 'Echo a test value',
+        required_tools: ['synthetic_echo'],
+      }),
+    });
+  });
+
+  it('runs a managed task through the task endpoint', async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          task: { id: 'task-1', status: 'completed' },
+          result: 'synthetic:atlas-test',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const { runAgentTask } = await freshApi();
+
+    await expect(runAgentTask('agent-1', 'task-1')).resolves.toMatchObject({
+      task: { id: 'task-1', status: 'completed' },
+      result: 'synthetic:atlas-test',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/v1/managed-agents/agent-1/tasks/task-1/run',
+      { method: 'POST', headers: {} },
+    );
+  });
+});
+
 describe('tool credentials', () => {
   it('reads credential status from the local server', async () => {
     fetchMock.mockResolvedValue(

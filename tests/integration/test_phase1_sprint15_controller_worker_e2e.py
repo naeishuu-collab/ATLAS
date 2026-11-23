@@ -41,32 +41,7 @@ from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.security.principal import TestPrincipalAuthority
 from openjarvis.server import agent_manager_routes
 from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
-
-
-class SyntheticEchoTool(BaseTool):
-    tool_id = "synthetic_echo"
-
-    def __init__(self):
-        self.calls = 0
-
-    @property
-    def spec(self):
-        return ToolSpec(
-            name=self.tool_id,
-            description="Return a deterministic synthetic value.",
-            parameters={
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-            category="synthetic",
-            effect=ToolEffect.READ_ONLY,
-        )
-
-    def execute(self, **params) -> ToolResult:
-        self.calls += 1
-        raise AssertionError("Controller executed SyntheticEchoTool locally")
+from openjarvis.tools.synthetic_echo import SyntheticEchoTool
 
 
 class ProbeTool(BaseTool):

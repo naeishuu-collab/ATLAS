@@ -19,6 +19,11 @@ except ImportError:
     pass
 
 try:
+    import openjarvis.tools.synthetic_echo  # noqa: F401
+except ImportError:
+    pass
+
+try:
     import openjarvis.tools.retrieval  # noqa: F401
 except ImportError:
     pass
