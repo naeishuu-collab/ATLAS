@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from tests.agents.fake_engine import FakeEngine
 
+import openjarvis.agents.executor as agent_executor_module
 from openjarvis.agents.manager import AgentManager
 from openjarvis.agents.orchestrator import OrchestratorAgent
 from openjarvis.agents.tool_semantics import arguments_sha256
@@ -41,32 +42,7 @@ from openjarvis.security.capabilities import CapabilityPolicy
 from openjarvis.security.principal import TestPrincipalAuthority
 from openjarvis.server import agent_manager_routes
 from openjarvis.tools._stubs import BaseTool, ToolExecutor, ToolSpec
-
-
-class SyntheticEchoTool(BaseTool):
-    tool_id = "synthetic_echo"
-
-    def __init__(self):
-        self.calls = 0
-
-    @property
-    def spec(self):
-        return ToolSpec(
-            name=self.tool_id,
-            description="Return a deterministic synthetic value.",
-            parameters={
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"],
-                "additionalProperties": False,
-            },
-            category="synthetic",
-            effect=ToolEffect.READ_ONLY,
-        )
-
-    def execute(self, **params) -> ToolResult:
-        self.calls += 1
-        raise AssertionError("Controller executed SyntheticEchoTool locally")
+from openjarvis.tools.synthetic_echo import SyntheticEchoTool
 
 
 class ProbeTool(BaseTool):
@@ -88,6 +64,11 @@ class ProbeTool(BaseTool):
         raise AssertionError("disallowed tool ran in the Controller")
 
 
+class ConfiguredProbeTool(ProbeTool):
+    def __init__(self):
+        super().__init__("task_probe")
+
+
 def _tool_call(name: str, **arguments):
     return {
         "tool_calls": [
@@ -107,6 +88,7 @@ def _controller(
     *,
     host_bootstrap=None,
     existing_agent_id=None,
+    engine_responses: list[dict] | None = None,
 ):
     monkeypatch.setitem(AgentRegistry._entries(), "orchestrator", OrchestratorAgent)
     monkeypatch.setitem(ToolRegistry._entries(), "synthetic_echo", SyntheticEchoTool)
@@ -136,7 +118,9 @@ def _controller(
         clear_stale_running=host_bootstrap is None,
     )
     engine = FakeEngine(
-        [
+        engine_responses
+        if engine_responses is not None
+        else [
             _tool_call("synthetic_echo", value="phase15"),
             {"content": "synthetic worker verified"},
         ]
@@ -250,8 +234,30 @@ def _forbid_thread_fallback(monkeypatch):
 def test_controller_api_executes_in_authenticated_worker_and_completes(
     tmp_path, monkeypatch
 ):
+    monkeypatch.setitem(ToolRegistry._entries(), "task_probe", ConfiguredProbeTool)
     manager, app, agent, engine, supervisors, authority, principal, key = _controller(
         tmp_path, monkeypatch
+    )
+    manager.update_agent(
+        agent["id"],
+        config={
+            **agent["config"],
+            "tools": ["synthetic_echo", "task_probe"],
+            "mcp_tools": True,
+        },
+    )
+    original_resolver = agent_executor_module.resolve_agent_tools
+    resolved_task_tools = []
+
+    def capture_task_tools(*args, **kwargs):
+        resolved = original_resolver(*args, **kwargs)
+        resolved_task_tools.append(
+            (kwargs.get("allowed_tool_names"), sorted(resolved.by_name))
+        )
+        return resolved
+
+    monkeypatch.setattr(
+        agent_executor_module, "resolve_agent_tools", capture_task_tools
     )
     _forbid_thread_fallback(monkeypatch)
     try:
@@ -261,6 +267,7 @@ def test_controller_api_executes_in_authenticated_worker_and_completes(
                 json={
                     "description": "Execute one deterministic synthetic operation.",
                     "required_tools": ["synthetic_echo"],
+                    "task_profile": "synthetic_echo_test",
                 },
             )
             assert created.status_code == 200, created.text
@@ -273,6 +280,14 @@ def test_controller_api_executes_in_authenticated_worker_and_completes(
             assert body["task"]["status"] == "completed"
             assert body["result"] == "synthetic worker verified"
             assert body["checkpoint_version"] >= 2
+            assert resolved_task_tools == [
+                (frozenset({"synthetic_echo"}), ["synthetic_echo"])
+            ]
+            assert (
+                body["task"]["completion_evidence"]["tools"][0]["tool_name"]
+                == "synthetic_echo"
+            )
+            assert len(body["task"]["completion_evidence"]["tools"]) == 1
             assert len(supervisors) == 1
             evidence = supervisors[0].evidence
             assert evidence["controller_pid"] == os.getpid()
@@ -602,6 +617,50 @@ def test_controller_worker_crash_after_dispatch_records_unknown(tmp_path, monkey
             assert records[0]["recovery_state"] == "UNKNOWN_OUTCOME"
         finally:
             second.close()
+    finally:
+        manager.close()
+
+
+def test_controller_rejects_second_synthetic_echo_dispatch(tmp_path, monkeypatch):
+    manager, app, agent, engine, supervisors, authority, principal, key = _controller(
+        tmp_path,
+        monkeypatch,
+        engine_responses=[
+            _tool_call("synthetic_echo", value="first"),
+            _tool_call("synthetic_echo", value="second"),
+            {"content": "finished"},
+        ],
+    )
+    _forbid_thread_fallback(monkeypatch)
+    try:
+        with TestClient(app) as client:
+            created = client.post(
+                f"/v1/managed-agents/{agent['id']}/tasks",
+                json={
+                    "description": "Attempt two deterministic synthetic operations.",
+                    "required_tools": ["synthetic_echo"],
+                    "task_profile": "synthetic_echo_test",
+                },
+            )
+            assert created.status_code == 200, created.text
+            task = created.json()
+            response = client.post(
+                f"/v1/managed-agents/{agent['id']}/tasks/{task['id']}/run"
+            )
+
+            assert response.status_code == 409
+            failed = manager._get_task(task["id"], agent_id=agent["id"])
+            assert failed["status"] == "failed"
+            assert len(supervisors) == 1
+            journal = manager.read_task_tool_journal(
+                task["id"], agent["id"], principal, authority, integrity_key=key
+            )
+            assert len(journal) == 1
+            assert journal[0]["tool_name"] == "synthetic_echo"
+            assert journal[0]["arguments_sha256"] == arguments_sha256(
+                {"value": "first"}
+            )
+            assert journal[0]["state"] == "CHECKPOINTED"
     finally:
         manager.close()
 

@@ -6,6 +6,9 @@ import { useAppStore } from '../lib/store';
 import {
   fetchManagedAgents,
   fetchAgentTasks,
+  createAgentTask,
+  runAgentTask,
+  isTauri,
   fetchAgentChannels,
   bindAgentChannel,
   unbindAgentChannel,
@@ -3426,6 +3429,9 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [agentManagerAvailable, setAgentManagerAvailable] = useState<boolean | null>(null);
   const [tasks, setTasks] = useState<AgentTask[]>([]);
+  const [syntheticValue, setSyntheticValue] = useState('');
+  const [syntheticResult, setSyntheticResult] = useState('');
+  const [runningSyntheticTask, setRunningSyntheticTask] = useState(false);
   const [channels, setChannels] = useState<ChannelBinding[]>([]);
   const [templates, setTemplates] = useState<AgentTemplate[]>([]);
   const [showWizard, setShowWizard] = useState(false);
@@ -3452,6 +3458,9 @@ export function AgentsPage() {
   }, [refresh]);
 
   const selectedAgent = managedAgents.find((a) => a.id === selectedAgentId);
+  const selectedAgentTools = selectedAgent?.config?.tools;
+  const canRunSyntheticTask =
+    Array.isArray(selectedAgentTools) && selectedAgentTools.includes('synthetic_echo');
 
   useEffect(() => {
     if (selectedAgentId) {
@@ -3468,6 +3477,36 @@ export function AgentsPage() {
   const handleResume = async (id: string) => {
     await resumeManagedAgent(id).catch(() => {});
     await refresh();
+  };
+
+  const handleRunSyntheticTask = async () => {
+    if (!selectedAgent || !canRunSyntheticTask || runningSyntheticTask) return;
+    const value = syntheticValue;
+    if (!value.trim()) return;
+    setRunningSyntheticTask(true);
+    setSyntheticResult('');
+    try {
+      const task = await createAgentTask(
+        selectedAgent.id,
+        'Call synthetic_echo exactly once with value ' + JSON.stringify(value) +
+          ' and report its returned result.',
+        ['synthetic_echo'],
+        'synthetic_echo_test',
+      );
+      const response = await runAgentTask(selectedAgent.id, task.id);
+      if (response.task.status !== 'completed') {
+        throw new Error('Synthetic task did not complete successfully.');
+      }
+      setSyntheticResult(response.result);
+      setSyntheticValue('');
+      toast.success('Synthetic task completed');
+      await fetchAgentTasks(selectedAgent.id).then(setTasks).catch(() => {});
+    } catch (err: any) {
+      await fetchAgentTasks(selectedAgent.id).then(setTasks).catch(() => {});
+      toast.error(err.message || 'Synthetic task failed');
+    } finally {
+      setRunningSyntheticTask(false);
+    }
   };
 
   const handleDelete = async (id: string) => {
@@ -3842,6 +3881,52 @@ export function AgentsPage() {
         {/* Tab: Tasks */}
         {detailTab === 'tasks' && (
           <div className="space-y-2">
+            {isTauri() && (
+              <div
+                className="p-3 rounded-lg space-y-2"
+                style={{ background: 'var(--color-bg-secondary)', border: '1px solid var(--color-border)' }}
+              >
+                <div>
+                  <div className="text-sm font-medium" style={{ color: 'var(--color-text)' }}>
+                    Synthetic echo test
+                  </div>
+                  <div className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                    Use non-sensitive test text. The prompt goes to the configured inference source. This task exposes only the side-effect-free synthetic_echo tool; other configured tools are unavailable.
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    aria-label="Synthetic echo test value"
+                    value={syntheticValue}
+                    onChange={(event) => setSyntheticValue(event.target.value)}
+                    maxLength={8192}
+                    placeholder="ATLAS test value"
+                    className="flex-1 min-w-0 rounded-md px-3 py-2 text-sm"
+                    style={{ background: 'var(--color-bg)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                    disabled={runningSyntheticTask}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleRunSyntheticTask}
+                    disabled={!canRunSyntheticTask || !syntheticValue.trim() || runningSyntheticTask}
+                    className="px-3 py-2 rounded-md text-sm font-medium disabled:opacity-50"
+                    style={{ background: 'var(--color-accent)', color: 'white' }}
+                  >
+                    {runningSyntheticTask ? 'Running…' : 'Run test'}
+                  </button>
+                </div>
+                {!canRunSyntheticTask && (
+                  <div className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+                    Select the synthetic_echo tool in this agent’s configuration first.
+                  </div>
+                )}
+                {syntheticResult && (
+                  <div role="status" className="text-sm break-words" style={{ color: 'var(--color-text)' }}>
+                    Agent response: {syntheticResult}
+                  </div>
+                )}
+              </div>
+            )}
             {tasks.map((t) => (
               <div
                 key={t.id}

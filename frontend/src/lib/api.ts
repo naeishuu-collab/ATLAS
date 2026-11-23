@@ -485,6 +485,7 @@ export interface AgentTask {
   progress: Record<string, unknown>;
   findings: unknown[];
   created_at: number;
+  task_profile?: 'standard' | 'synthetic_echo_test';
 }
 
 export interface ChannelBinding {
@@ -587,11 +588,31 @@ export async function fetchAgentTasks(agentId: string): Promise<AgentTask[]> {
   return data.tasks || [];
 }
 
-export async function createAgentTask(agentId: string, description: string): Promise<AgentTask> {
+export async function createAgentTask(
+  agentId: string,
+  description: string,
+  requiredTools: string[] = [],
+  taskProfile: 'standard' | 'synthetic_echo_test' = 'standard',
+): Promise<AgentTask> {
   const res = await apiFetch(`/v1/managed-agents/${agentId}/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ description }),
+    body: JSON.stringify({
+      description,
+      required_tools: requiredTools,
+      task_profile: taskProfile,
+    }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+  return res.json();
+}
+
+export async function runAgentTask(
+  agentId: string,
+  taskId: string,
+): Promise<{ task: AgentTask; result: string }> {
+  const res = await apiFetch(`/v1/managed-agents/${agentId}/tasks/${taskId}/run`, {
+    method: 'POST',
   });
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
   return res.json();

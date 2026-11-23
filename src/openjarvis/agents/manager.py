@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS agent_tasks (
     checkpoint_id   TEXT,
     checkpoint_version INTEGER NOT NULL DEFAULT 0,
     required_tools_json TEXT NOT NULL DEFAULT '[]',
+    task_profile    TEXT NOT NULL DEFAULT 'standard',
     completion_evidence_json TEXT NOT NULL DEFAULT '{}',
     cancellation_state TEXT NOT NULL DEFAULT 'ACTIVE',
     revocation_state TEXT NOT NULL DEFAULT 'ACTIVE',
@@ -235,6 +236,8 @@ class AgentManager:
             "INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE agent_tasks ADD COLUMN required_tools_json "
             "TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE agent_tasks ADD COLUMN task_profile "
+            "TEXT NOT NULL DEFAULT 'standard'",
             "ALTER TABLE agent_tasks ADD COLUMN completion_evidence_json "
             "TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE agent_tasks ADD COLUMN cancellation_state "
@@ -1169,20 +1172,41 @@ class AgentManager:
         status: str = "pending",
         *,
         required_tools: list[str] | None = None,
+        task_profile: str = "standard",
     ) -> Dict[str, Any]:
         required_tools = required_tools or []
         if not isinstance(required_tools, list) or any(
             not isinstance(name, str) or not name.strip() for name in required_tools
         ):
             raise ValueError("required tool names must be non-empty strings")
+        if not isinstance(task_profile, str) or task_profile not in {
+            "standard",
+            "synthetic_echo_test",
+        }:
+            raise ValueError("invalid task profile")
         required_tools = list(dict.fromkeys(name.strip() for name in required_tools))
+        if task_profile == "synthetic_echo_test" and required_tools != [
+            "synthetic_echo"
+        ]:
+            raise ValueError(
+                "synthetic echo test profile requires exactly synthetic_echo"
+            )
         task_id = uuid.uuid4().hex[:12]
         now = time.time()
         self._conn.execute(
             "INSERT INTO agent_tasks "
-            "(id, agent_id, description, status, required_tools_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_id, agent_id, description, status, json.dumps(required_tools), now),
+            "(id, agent_id, description, status, required_tools_json, "
+            "task_profile, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                agent_id,
+                description,
+                status,
+                json.dumps(required_tools),
+                task_profile,
+                now,
+            ),
         )
         self._conn.commit()
         return self._get_task(task_id)  # type: ignore[return-value]
@@ -2099,6 +2123,20 @@ class AgentManager:
             task = self._get_task(task_id, agent_id=agent_id)
             if task is None or deadline > binding["lease_expires_at"]:
                 raise PermissionError("task tool journal lease invalid")
+            if task["task_profile"] == "synthetic_echo_test":
+                if tool_name != "synthetic_echo":
+                    raise PermissionError(
+                        "synthetic task tool is outside its allowlist"
+                    )
+                if (
+                    self._conn.execute(
+                        "SELECT 1 FROM task_tool_journal "
+                        "WHERE task_id=? AND tool_name='synthetic_echo' LIMIT 1",
+                        (task_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise PermissionError("synthetic task dispatch budget is exhausted")
             checkpoint = self.get_bound_task_checkpoint(
                 task_id, agent_id, principal, authority, integrity_key=integrity_key
             )
@@ -2722,6 +2760,11 @@ class AgentManager:
             messages = conversation.get("messages")
             if not isinstance(messages, list):
                 raise PermissionError("checkpoint tool evidence is missing")
+            tool_messages = [
+                message
+                for message in messages
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ]
             checkpoint_results = {
                 (
                     message.get("name"),
@@ -2729,26 +2772,22 @@ class AgentManager:
                         (message.get("content") or "").encode("utf-8")
                     ).hexdigest(),
                 )
-                for message in messages
-                if isinstance(message, dict) and message.get("role") == "tool"
+                for message in tool_messages
             }
-            checkpoint_tool_names = {
-                message.get("name")
-                for message in messages
-                if isinstance(message, dict) and message.get("role") == "tool"
-            }
+            checkpoint_tool_names = {message.get("name") for message in tool_messages}
             completed_steps = tool_state.get("completed_steps")
-            executed_tools = (
-                {
-                    step.get("tool")
+            executed_steps = (
+                [
+                    step
                     for step in completed_steps
                     if isinstance(step, dict)
                     and step.get("state") == "EXECUTED"
                     and step.get("execution_state") == "EXECUTED"
-                }
+                ]
                 if isinstance(completed_steps, list)
-                else set()
+                else []
             )
+            executed_tools = {step.get("tool") for step in executed_steps}
             successful = set()
             for item in tool_evidence:
                 if (
@@ -2770,6 +2809,17 @@ class AgentManager:
             required = set(task["required_tools"])
             if not successful or not required.issubset(successful):
                 raise PermissionError("required task operations were not verified")
+            if task["task_profile"] == "synthetic_echo_test" and (
+                len(tool_evidence) != 1
+                or tool_evidence[0]["tool_name"] != "synthetic_echo"
+                or len(tool_messages) != 1
+                or tool_messages[0].get("name") != "synthetic_echo"
+                or len(executed_steps) != 1
+                or executed_steps[0].get("tool") != "synthetic_echo"
+            ):
+                raise PermissionError(
+                    "synthetic task must verify exactly one synthetic_echo call"
+                )
             checkpoint_calls = {
                 (
                     message.get("name"),
@@ -2795,6 +2845,13 @@ class AgentManager:
             ).fetchall()
             if not journal_rows or len(journal_rows) != len(tool_evidence):
                 raise PermissionError("task tool journal is incomplete")
+            if task["task_profile"] == "synthetic_echo_test" and (
+                len(journal_rows) != 1
+                or journal_rows[0]["tool_name"] != "synthetic_echo"
+            ):
+                raise PermissionError(
+                    "synthetic task journal must contain exactly one echo call"
+                )
             for stored in journal_rows:
                 row = dict(stored)
                 old_mac = row.pop("mac")
@@ -3326,6 +3383,7 @@ class AgentManager:
             "checkpoint_id": row["checkpoint_id"],
             "checkpoint_version": row["checkpoint_version"],
             "required_tools": json.loads(row["required_tools_json"] or "[]"),
+            "task_profile": row["task_profile"],
             "completion_evidence": json.loads(row["completion_evidence_json"] or "{}"),
             "cancellation_state": row["cancellation_state"],
             "revocation_state": row["revocation_state"],

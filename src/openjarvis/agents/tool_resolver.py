@@ -319,6 +319,7 @@ def resolve_agent_tools(
     mcp_tools: Iterable[Any] = (),
     mcp_clients: Iterable[Any] = (),
     knowledge_db_path: str | Path | None = None,
+    allowed_tool_names: Iterable[str] | None = None,
 ) -> ResolvedAgentTools:
     """Resolve the effective live toolkit for a managed agent.
 
@@ -330,6 +331,14 @@ def resolve_agent_tools(
 
     ensure_registries_populated()
     from openjarvis.core.registry import ChannelRegistry, ToolRegistry
+
+    if isinstance(allowed_tool_names, str):
+        raise ValueError("allowed tool names must be an iterable of names")
+    allowed = None if allowed_tool_names is None else frozenset(allowed_tool_names)
+    if allowed is not None and any(
+        not isinstance(name, str) or not name.strip() for name in allowed
+    ):
+        raise ValueError("allowed tool names must be non-empty strings")
 
     config = agent_record.get("config") or {}
     if not isinstance(config, Mapping):
@@ -354,7 +363,11 @@ def resolve_agent_tools(
         seen.add(name)
 
     use_mcp = config.get("mcp_tools", True) is not False
-    mcp_tool_list = list(mcp_tools) if use_mcp else []
+    mcp_tool_list = (
+        [tool for tool in mcp_tools if allowed is None or _tool_name(tool) in allowed]
+        if use_mcp
+        else []
+    )
     mcp_by_name: dict[str, Any] = {}
     for tool in mcp_tool_list:
         name = _tool_name(tool)
@@ -369,6 +382,8 @@ def resolve_agent_tools(
         )
         owned_ids: set[int] = set()
         for tool in granted_tools:
+            if allowed is not None and _tool_name(tool) not in allowed:
+                continue
             resource = getattr(tool, "_store", None)
             if (
                 resource is not None
@@ -383,6 +398,8 @@ def resolve_agent_tools(
         if isinstance(entry, Mapping):
             raw_spec = entry if isinstance(entry, dict) else dict(entry)
             name = _spec_name(raw_spec)
+            if allowed is not None and name not in allowed:
+                continue
             if name and name in seen:
                 continue
 
@@ -425,6 +442,8 @@ def resolve_agent_tools(
 
         names = BROWSER_SUB_TOOLS if entry == "browser" else (entry,)
         for name in names:
+            if allowed is not None and name not in allowed:
+                continue
             if name in seen:
                 continue
             if ChannelRegistry.contains(name):
@@ -459,7 +478,7 @@ def resolve_agent_tools(
         instances=instances,
         extra_specs=extra_specs,
         advertised_specs=advertised_specs,
-        mcp_clients=list(mcp_clients) if use_mcp else [],
+        mcp_clients=(list(mcp_clients) if use_mcp and allowed is None else []),
         owned_resources=owned_resources,
     )
 

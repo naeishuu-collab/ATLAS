@@ -276,6 +276,7 @@ DEFAULT_TOOL_CAPABILITIES: Dict[str, List[str]] = {
     "schedule_task": [Capability.SCHEDULE_CREATE],
     "shell_exec": [Capability.CODE_EXECUTE],
     "skill_manage": [Capability.FILE_READ, Capability.FILE_WRITE],
+    "synthetic_echo": [],
     "text_to_speech": [Capability.NETWORK_FETCH, Capability.FILE_WRITE],
     "think": [],
     "user_profile_manage": [Capability.FILE_READ, Capability.FILE_WRITE],
@@ -284,6 +285,10 @@ DEFAULT_TOOL_CAPABILITIES: Dict[str, List[str]] = {
 
 _SAFE_BUILTIN_PROVENANCE = {
     "calculator": ("openjarvis.tools.calculator", "CalculatorTool"),
+    "synthetic_echo": (
+        "openjarvis.tools.synthetic_echo",
+        "SyntheticEchoTool",
+    ),
     "think": ("openjarvis.tools.think", "ThinkTool"),
 }
 
