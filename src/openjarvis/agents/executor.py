@@ -3172,6 +3172,22 @@ class AgentExecutor:
             raise FatalError(f"Unknown agent type: {agent_type}")
 
         config = agent.get("config", {})
+        task_runtime = agent.get("_managed_runtime") or {}
+        task_context = task_runtime.get("task_context")
+        task_allowlist = None
+        if isinstance(task_context, dict) and "tool_allowlist" in task_context:
+            raw_allowlist = task_context["tool_allowlist"]
+            if (
+                not isinstance(raw_allowlist, (list, tuple))
+                or not raw_allowlist
+                or any(
+                    not isinstance(name, str) or not name or name.strip() != name
+                    for name in raw_allowlist
+                )
+                or len(set(raw_allowlist)) != len(raw_allowlist)
+            ):
+                raise PermissionError("task tool allowlist is invalid")
+            task_allowlist = frozenset(raw_allowlist)
         try:
             tool_requirement = ToolRequirement(
                 config.get("tool_requirement", ToolRequirement.OPTIONAL.value)
@@ -3259,7 +3275,8 @@ class AgentExecutor:
         mcp_tools: list[Any] = []
         mcp_clients: list[Any] = []
         if (
-            config.get("mcp_tools", True) is not False
+            task_allowlist is None
+            and config.get("mcp_tools", True) is not False
             and self._system is not None
             and (agent_accepts_tools or supports_tool_fallback)
         ):
@@ -3318,6 +3335,7 @@ class AgentExecutor:
             mcp_tools=mcp_tools,
             mcp_clients=mcp_clients,
             knowledge_db_path=getattr(self._system, "knowledge_db_path", None),
+            allowed_tool_names=task_allowlist,
         )
         self._toolkit_local.current = resolved_toolkit
         tool_instances = resolved_toolkit.instances
@@ -3532,6 +3550,13 @@ class AgentExecutor:
                 def dispatch_task_tool(tool_call, params, *, timeout):
                     from openjarvis.control.task_worker import TaskWorkerExecutionError
 
+                    if (
+                        task_allowlist is not None
+                        and tool_call.name not in task_allowlist
+                    ):
+                        raise PermissionError(
+                            "task tool is outside its authenticated allowlist"
+                        )
                     if tool_call.name != "synthetic_echo":
                         return supervisor.execute_tool(
                             tool_call, params, timeout=timeout

@@ -100,7 +100,12 @@ describe('managed-agent task endpoints', () => {
     );
     const { createAgentTask } = await freshApi();
 
-    await createAgentTask('agent-1', 'Echo a test value', ['synthetic_echo']);
+    await createAgentTask(
+      'agent-1',
+      'Echo a test value',
+      ['synthetic_echo'],
+      'synthetic_echo_test',
+    );
 
     expect(fetchMock).toHaveBeenCalledWith('/v1/managed-agents/agent-1/tasks', {
       method: 'POST',
@@ -108,6 +113,7 @@ describe('managed-agent task endpoints', () => {
       body: JSON.stringify({
         description: 'Echo a test value',
         required_tools: ['synthetic_echo'],
+        task_profile: 'synthetic_echo_test',
       }),
     });
   });

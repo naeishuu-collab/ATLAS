@@ -8,7 +8,7 @@ import re as _re
 import secrets
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from openjarvis.agents.manager import AgentManager
 from openjarvis.agents.tool_resolver import (
@@ -150,6 +150,7 @@ class UpdateAgentRequest(BaseModel):
 class CreateTaskRequest(BaseModel):
     description: str
     required_tools: Optional[List[str]] = None
+    task_profile: Literal["standard", "synthetic_echo_test"] = "standard"
 
 
 class UpdateTaskRequest(BaseModel):
@@ -1941,6 +1942,7 @@ def create_agent_manager_router(
                 agent_id,
                 description=req.description,
                 required_tools=req.required_tools or [],
+                task_profile=req.task_profile,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2117,9 +2119,22 @@ def create_agent_manager_router(
                 "controller_worker_required": True,
                 "task_worker_supervisor": task_worker,
             }
+            if task["task_profile"] == "synthetic_echo_test":
+                task_context["tool_allowlist"] = ["synthetic_echo"]
             result = executor.execute_tick(agent_id, task_context=task_context)
             if result is None:
                 raise PermissionError("executor did not produce a verified result")
+            if task["task_profile"] == "synthetic_echo_test":
+                tool_results = getattr(result, "tool_results", None)
+                if (
+                    not isinstance(tool_results, (list, tuple))
+                    or len(tool_results) != 1
+                    or getattr(tool_results[0], "tool_name", None) != "synthetic_echo"
+                    or getattr(tool_results[0], "success", None) is not True
+                ):
+                    raise PermissionError(
+                        "synthetic task must execute exactly one successful echo call"
+                    )
             evidence = [
                 {
                     "tool_name": getattr(item, "tool_name", None),

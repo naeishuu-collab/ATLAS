@@ -3491,6 +3491,7 @@ export function AgentsPage() {
         'Call synthetic_echo exactly once with value ' + JSON.stringify(value) +
           ' and report its returned result.',
         ['synthetic_echo'],
+        'synthetic_echo_test',
       );
       const response = await runAgentTask(selectedAgent.id, task.id);
       if (response.task.status !== 'completed') {
@@ -3890,7 +3891,7 @@ export function AgentsPage() {
                     Synthetic echo test
                   </div>
                   <div className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
-                    Use non-sensitive test text. The task prompt goes to the configured inference source; the worker accepts only the side-effect-free synthetic_echo tool.
+                    Use non-sensitive test text. The prompt goes to the configured inference source. This task exposes only the side-effect-free synthetic_echo tool; other configured tools are unavailable.
                   </div>
                 </div>
                 <div className="flex gap-2">

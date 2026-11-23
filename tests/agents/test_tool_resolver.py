@@ -282,3 +282,30 @@ def test_mcp_tools_can_be_disabled_per_agent() -> None:
 
     assert [tool.spec.name for tool in resolved.instances] == ["shared"]
     assert resolved.mcp_clients == []
+
+
+def test_task_allowlist_filters_agent_grants_configured_and_mcp_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ToolRegistry.register_value("alpha", _AlphaTool)
+    ToolRegistry.register_value("beta", _BetaTool)
+    monkeypatch.setattr(
+        tool_resolver,
+        "build_deep_research_tools",
+        lambda **_kwargs: [_BetaTool(), _AlphaTool()],
+    )
+
+    resolved = tool_resolver.resolve_agent_tools(
+        {
+            "agent_type": "deep_research",
+            "config": {"tools": ["alpha", "beta"], "mcp_tools": True},
+        },
+        engine=object(),
+        model="test-model",
+        mcp_tools=[_MCPOnlyTool()],
+        mcp_clients=[object()],
+        allowed_tool_names={"alpha"},
+    )
+
+    assert [tool.spec.name for tool in resolved.instances] == ["alpha"]
+    assert resolved.mcp_clients == []
